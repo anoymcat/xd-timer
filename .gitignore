@@ -17,6 +17,8 @@ build/
 dist/
 *.egg-info/
 .eggs/
+_portable_build/
+DeskTimer_portable.zip
 
 # Testing / coverage
 .pytest_cache/

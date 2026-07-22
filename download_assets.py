@@ -13,7 +13,15 @@ import shutil
 ASSETS_DIR = "assets"
 CHAMP_DIR = os.path.join(ASSETS_DIR, "champions")
 SPELL_DIR = os.path.join(ASSETS_DIR, "spells")
+RUNE_DIR = os.path.join(ASSETS_DIR, "runes")
 VERSION_FILE = os.path.join(ASSETS_DIR, "version.txt")
+
+# Rune icons (from CommunityDragon; DDragon doesn't serve these cleanly).
+# Only the ones the app actually uses as toggles.
+RUNE_URLS = {
+    "CosmicInsight": "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/"
+                     "global/default/v1/perk-images/styles/inspiration/cosmicinsight/cosmicinsight.png",
+}
 
 # Spells list
 SPELL_IDS = [
@@ -103,6 +111,7 @@ def main():
     # 1. Setup Directories
     os.makedirs(CHAMP_DIR, exist_ok=True)
     os.makedirs(SPELL_DIR, exist_ok=True)
+    os.makedirs(RUNE_DIR, exist_ok=True)
 
     # 2. Check Version
     print("--- LoL Asset Manager ---")
@@ -142,6 +151,12 @@ def main():
     for spell in SPELL_IDS:
         url = f"https://ddragon.leagueoflegends.com/cdn/{latest_ver}/img/spell/{spell}.png"
         path = os.path.join(SPELL_DIR, f"{spell}.png")
+        download_file(url, path, force=force_update)
+
+    # 4b. Download Rune icons (CommunityDragon 'latest' — not version-pinned)
+    print("\n--- Syncing Runes ---")
+    for name, url in RUNE_URLS.items():
+        path = os.path.join(RUNE_DIR, f"{name}.png")
         download_file(url, path, force=force_update)
 
     # 5. Finalize
