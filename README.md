@@ -49,6 +49,15 @@ python download_assets.py    :: 下载英雄/技能图标
 
 > 便携版跑的仍是官方 `python.exe` + `.py` 源码，**非 PyInstaller 编译 exe**。首次启动可能被 SmartScreen/杀软误报，自行判断放行。
 
+## 致谢 / Credits
+
+- **本项目源码 / Source**：[anoymcat/xd-timer](https://github.com/anoymcat/xd-timer)（私有，自用）。
+- 开发中参考、学习的项目：
+  - [lovelybbq/lol-spell-timer](https://github.com/lovelybbq/lol-spell-timer) —— 本项目的改造蓝本（Python / tkinter 召唤师技能计时器）。DeskTimer 在其基础上**去除 overlay 行为**（无边框 + 置顶 + 半透明），改为普通副屏窗口。
+  - [LeagueAkari/LeagueAkari](https://github.com/LeagueAkari/LeagueAkari) —— 功能全面、基于 LCU / 本地 API 的非侵入式 LoL 客户端工具集。主要参考其在**合规与封禁风险规避**上的思路，帮助本项目守住「仅用官方本地接口、不注入 / 不挂钩 / 不覆盖游戏 / 不用于腾讯服」的边界。
+
+> 参考项目版权归各自作者所有；本项目仅自用、不对外分发。
+
 ## 更新日志 / Patch Notes
 
 ### 2026-07-22
