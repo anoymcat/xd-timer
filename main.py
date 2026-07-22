@@ -157,6 +157,46 @@ class DDragonManager:
         except Exception as e:
             print(f"[DDragon] Update failed: {e}")
 
+# --- ABILITY (ULTIMATE) DATA ---
+class AbilityData:
+    """本地读取 download_assets.py 生成的两份快照：
+       r_index.json  -> {champKey: {"icon": file, "cd": [r1,r2,r3]}}
+       item_ah.json  -> {itemId: abilityHaste}
+    读不到就返回空/0，功能自动降级（不加 R 按钮）。"""
+    R_INDEX: Dict[str, Dict] = {}
+    ITEM_AH: Dict[int, int] = {}
+    _loaded = False
+
+    @classmethod
+    def load(cls):
+        if cls._loaded:
+            return
+        cls._loaded = True
+        base = resource_path(os.path.join("assets", "abilities"))
+        try:
+            with open(os.path.join(base, "r_index.json"), encoding="utf-8") as f:
+                cls.R_INDEX = json.load(f)
+            print(f"[AbilityData] R index: {len(cls.R_INDEX)} champions")
+        except Exception as e:
+            print(f"[AbilityData] r_index load failed: {e}")
+        try:
+            with open(os.path.join(base, "item_ah.json"), encoding="utf-8") as f:
+                cls.ITEM_AH = {int(k): int(v) for k, v in json.load(f).items()}
+            print(f"[AbilityData] item AH map: {len(cls.ITEM_AH)} items")
+        except Exception as e:
+            print(f"[AbilityData] item_ah load failed: {e}")
+
+    @classmethod
+    def item_ah(cls, item_id) -> int:
+        try:
+            return cls.ITEM_AH.get(int(item_id), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def r_info(cls, champ_key: str) -> Optional[Dict]:
+        return cls.R_INDEX.get(champ_key)
+
 # --- DATA MANAGER ---
 class GameDataManager:
     # localhost 2999 MUST bypass any system proxy. When global traffic is routed
@@ -205,21 +245,23 @@ class GameDataManager:
             champ_name = GameDataManager._resolve_champ_name(p)
             spells = p.get("summonerSpells", {})
             
-            # --- CALCULATE HASTE (ITEMS ONLY) ---
+            # --- HASTE FROM ITEMS ---
+            # summoner-spell haste (boots) and ability haste (all AH items) are DIFFERENT stats.
             items = p.get("items", [])
-            current_haste = 0
-            
+            current_haste = 0     # summoner-spell haste (for flash/TP/...)
+            ability_haste = 0     # ability haste (for R)
             for item in items:
                 i_id = item.get("itemID", 0)
-                # Add haste if item is in our database
-                val = Config.ITEM_HASTE_MAP.get(i_id, 0)
-                current_haste += val
-            
+                current_haste += Config.ITEM_HASTE_MAP.get(i_id, 0)
+                ability_haste += AbilityData.item_ah(i_id)
+
             enemies.append({
                 "champ": champ_name,
                 "spell1": GameDataManager._clean_spell_name(spells.get("summonerSpellOne", {}).get("rawDisplayName")),
                 "spell2": GameDataManager._clean_spell_name(spells.get("summonerSpellTwo", {}).get("rawDisplayName")),
                 "haste": current_haste,
+                "ability_haste": ability_haste,
+                "level": p.get("level", 1),
                 "position": (p.get("position") or "").upper(),
             })
         return enemies
@@ -272,8 +314,10 @@ class GameDataManager:
     def _get_dummy_data():
         return [
             # Top laner WITHOUT native TP -> should get the extra Unleashed TP button.
-            {"champ": "Darius", "spell1": "SummonerFlash", "spell2": "SummonerDot", "haste": 0, "position": "TOP"},
-            {"champ": "Ornn", "spell1": "SummonerFlash", "spell2": "SummonerTeleport", "haste": 20, "position": "MIDDLE"},
+            {"champ": "Darius", "spell1": "SummonerFlash", "spell2": "SummonerDot",
+             "haste": 0, "ability_haste": 20, "level": 16, "position": "TOP"},
+            {"champ": "Ornn", "spell1": "SummonerFlash", "spell2": "SummonerTeleport",
+             "haste": 20, "ability_haste": 0, "level": 11, "position": "MIDDLE"},
         ]
 
 # --- ASSET MANAGER ---
@@ -343,17 +387,21 @@ class AssetManager:
 # --- SPELL TIMER WIDGET ---
 class SpellTimerWidget(tk.Canvas):
     def __init__(self, parent, champ_name: str, spell_name: str, app_ref,
-                 base_cd: Optional[int] = None, icon_name: Optional[str] = None):
+                 base_cd: Optional[int] = None, icon_name: Optional[str] = None,
+                 folder: str = "spells", r_cds: Optional[list] = None,
+                 use_ability_haste: bool = False):
         super().__init__(parent, width=Config.ICON_SIZE, height=Config.ICON_SIZE,
                          bg=Config.COLOR_BG, highlightthickness=0)
         self.champ_name = champ_name
         self.spell_name = spell_name
         self.app_ref = app_ref # Reference to main app to access cache
         self.base_cd_override = base_cd  # e.g. Unleashed TP = 420, bypasses SPELL_TIMERS
+        self.r_cds = r_cds               # ultimate: per-rank CDs; base picked by enemy level
+        self.use_ability_haste = use_ability_haste  # R uses Ability Haste, not summoner haste
         self.is_active = False
         self.timer_job = None
 
-        self.icon_img = AssetManager.load_icon("spells", icon_name or spell_name, (Config.ICON_SIZE, Config.ICON_SIZE))
+        self.icon_img = AssetManager.load_icon(folder, icon_name or spell_name, (Config.ICON_SIZE, Config.ICON_SIZE))
         self.create_image(0, 0, image=self.icon_img, anchor="nw")
         
         self.dim_img = AssetManager.create_dim_layer((Config.ICON_SIZE, Config.ICON_SIZE))
@@ -365,14 +413,26 @@ class SpellTimerWidget(tk.Canvas):
 
     def _on_left_click(self, event):
         if self.is_active: return
-        key = self.spell_name.lower()
-        base_cd = self.base_cd_override if self.base_cd_override is not None \
-            else Config.SPELL_TIMERS.get(key, 300)
-        
+
+        # --- BASE CD ---
+        if self.r_cds:
+            # Ultimate: rank estimated from the enemy's CURRENT level (cache, live).
+            rank = self.app_ref.rank_from_level(self.champ_name)
+            if rank <= 0:
+                return  # ult not unlocked yet (level < 6) -> ignore click
+            base_cd = self.r_cds[min(rank, len(self.r_cds)) - 1]
+        elif self.base_cd_override is not None:
+            base_cd = self.base_cd_override
+        else:
+            base_cd = Config.SPELL_TIMERS.get(self.spell_name.lower(), 300)
+
         # --- CALCULATE COOLDOWN WITH HASTE ---
-        # Get current haste from app cache (updated in background)
-        current_haste = self.app_ref.get_haste(self.champ_name)
-        
+        # R -> Ability Haste (items); summoner spells -> summoner-spell haste (+cosmic).
+        if self.use_ability_haste:
+            current_haste = self.app_ref.get_ability_haste(self.champ_name)
+        else:
+            current_haste = self.app_ref.get_haste(self.champ_name)
+
         # Formula: ReducedCooldown = Base * (100 / (100 + Haste))
         if current_haste > 0:
             final_cd = base_cd * (100 / (100 + current_haste))
@@ -528,6 +588,21 @@ class OverlayApp:
         if self.cosmic_toggle.get(champ_name):
             haste += Config.COSMIC_HASTE
         return haste
+
+    def get_ability_haste(self, champ_name: str) -> int:
+        """Ability Haste (for R) = sum of AH from the enemy's items (auto).
+        Note: rune/other AH (e.g. Transcendence) isn't exposed -> may undercount."""
+        return self.enemy_data_cache.get(champ_name, {}).get('ability_haste', 0)
+
+    def rank_from_level(self, champ_name: str) -> int:
+        """Estimate ultimate rank from the enemy's current level (R at 6/11/16).
+        Players almost always level R on cooldown, so this is a good heuristic.
+        Returns 0 if the ult isn't unlocked yet (< level 6)."""
+        lvl = self.enemy_data_cache.get(champ_name, {}).get('level', 1) or 1
+        if lvl >= 16: return 3
+        if lvl >= 11: return 2
+        if lvl >= 6:  return 1
+        return 0
 
     def _setup_tray(self):
         def quit_app(icon, item):
@@ -715,6 +790,17 @@ class OverlayApp:
             # (fallback for blind pick / modes where API 'position' is empty).
             lbl.bind("<Button-3>", lambda e, c=champ: self._toggle_tp(c))
 
+            # --- Ultimate (R): icon from DDragon, CD by rank(level), Ability Haste from items ---
+            r_info = AbilityData.r_info(champ)
+            if r_info and r_info.get('cd'):
+                r_icon = os.path.splitext(r_info['icon'])[0]  # e.g. "SeraphineR"
+                rw = SpellTimerWidget(row, champ, "R", self, icon_name=r_icon,
+                                      folder="abilities", r_cds=r_info['cd'],
+                                      use_ability_haste=True)
+                rw.pack(side="left", padx=(0, s(6)))
+                self._img_refs.append(rw.icon_img)
+                self._img_refs.append(rw.dim_img)
+
             for s_name in [enemy['spell1'], enemy['spell2']]:
                 # Pass 'self' (app) reference so the button can query cache
                 sw = SpellTimerWidget(row, champ, s_name, self)
@@ -811,5 +897,6 @@ if __name__ == "__main__":
 
     _enable_dpi_awareness()
     DDragonManager.update_timers()
+    AbilityData.load()
     app = OverlayApp()
     app.run()

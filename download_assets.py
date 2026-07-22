@@ -6,6 +6,7 @@ Checks for LoL updates via DDragon.
 """
 
 import os
+import json
 import requests
 import shutil
 
@@ -14,7 +15,11 @@ ASSETS_DIR = "assets"
 CHAMP_DIR = os.path.join(ASSETS_DIR, "champions")
 SPELL_DIR = os.path.join(ASSETS_DIR, "spells")
 RUNE_DIR = os.path.join(ASSETS_DIR, "runes")
+ABILITY_DIR = os.path.join(ASSETS_DIR, "abilities")   # ultimate (R) icons + data
 VERSION_FILE = os.path.join(ASSETS_DIR, "version.txt")
+
+# Per-item Ability Haste (Meraki static data — DDragon/CDragon don't expose AH cleanly).
+MERAKI_ITEMS_URL = "https://cdn.merakianalytics.com/riot/lol/resources/latest/en-US/items.json"
 
 # Rune icons (from CommunityDragon; DDragon doesn't serve these cleanly).
 # Only the ones the app actually uses as toggles.
@@ -107,11 +112,59 @@ def create_placeholder():
     except Exception:
         pass # Font issues usually
 
+def sync_abilities(version, force):
+    """下载每个英雄的大招(R)图标，并生成两份本地数据供 main.py 离线读取：
+      - assets/abilities/r_index.json  : {champKey: {"icon": file, "cd": [r1,r2,r3]}}
+      - assets/abilities/item_ah.json  : {itemId: abilityHaste}
+    这样运行时不必再访问外网（R CD 随补丁变，靠重跑本脚本更新）。"""
+    os.makedirs(ABILITY_DIR, exist_ok=True)
+    print("\n--- Syncing Ultimates (R) ---")
+    url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/championFull.json"
+    try:
+        data = requests.get(url, timeout=30).json().get("data", {})
+    except Exception as e:
+        print(f" [!] championFull.json failed: {e}")
+        return
+
+    r_index = {}
+    for champ, info in data.items():
+        spells = info.get("spells", [])
+        if len(spells) < 4:
+            continue
+        r = spells[3]  # index 3 = R
+        icon = r.get("image", {}).get("full")
+        cd = r.get("cooldown", [])
+        if not icon or not cd:
+            continue
+        r_index[champ] = {"icon": icon, "cd": cd}
+        img_url = f"https://ddragon.leagueoflegends.com/cdn/{version}/img/spell/{icon}"
+        download_file(img_url, os.path.join(ABILITY_DIR, icon), force=force)
+    with open(os.path.join(ABILITY_DIR, "r_index.json"), "w", encoding="utf-8") as f:
+        json.dump(r_index, f, ensure_ascii=False)
+    print(f" [i] R index: {len(r_index)} champions")
+
+    # item -> ability haste (Meraki)
+    print("--- Syncing Item Ability Haste (Meraki) ---")
+    try:
+        items = requests.get(MERAKI_ITEMS_URL, timeout=30).json()
+        item_ah = {}
+        for iid, it in items.items():
+            ah = (it.get("stats", {}) or {}).get("abilityHaste", {}).get("flat", 0)
+            if ah:
+                item_ah[str(iid)] = int(ah)
+        with open(os.path.join(ABILITY_DIR, "item_ah.json"), "w", encoding="utf-8") as f:
+            json.dump(item_ah, f)
+        print(f" [i] Item AH map: {len(item_ah)} items")
+    except Exception as e:
+        print(f" [!] Meraki item AH failed: {e}")
+
+
 def main():
     # 1. Setup Directories
     os.makedirs(CHAMP_DIR, exist_ok=True)
     os.makedirs(SPELL_DIR, exist_ok=True)
     os.makedirs(RUNE_DIR, exist_ok=True)
+    os.makedirs(ABILITY_DIR, exist_ok=True)
 
     # 2. Check Version
     print("--- LoL Asset Manager ---")
@@ -158,6 +211,9 @@ def main():
     for name, url in RUNE_URLS.items():
         path = os.path.join(RUNE_DIR, f"{name}.png")
         download_file(url, path, force=force_update)
+
+    # 4c. Ultimate (R) icons + per-rank cooldowns, and item -> ability haste map
+    sync_abilities(latest_ver, force_update)
 
     # 5. Finalize
     save_local_version(latest_ver)

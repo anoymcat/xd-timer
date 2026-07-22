@@ -19,6 +19,7 @@
 - ✅ 置顶可开关（默认开，托盘切换，存 config）。
 - ✅ 星界洞悉手动开关（每敌 +18，眼睛图标切换）+ 上单附赠 Unleashed Teleport（420s）自动/手动按钮。
 - ✅ DPI 感知 + 托盘比例缩放（50–200%）+ 海克斯金双线边框。
+- ✅ 大招（R）计时：R 图标 + 按等级估基础 CD + 自动吃装备 Ability Haste（见 §3 大招 R CD）。
 - ⏳ 未实测：真实"靴子 haste"套用（测试时 AI 未出明朗之靴；公式与逻辑已确认）。
 
 ## 3. 架构与关键实现
@@ -30,7 +31,9 @@
 - **英雄名（`_resolve_champ_name`）**：`rawChampionName` 实测有**两种格式**——`Character_Seraphine_Name`（key 在中间，对局中敌方实际格式）和 `game_character_displayname_Seraphine`（key 在末尾，早期测试格式）。**不能死取 `split("_")[-1]`**（会取到 `Name` → 头像加载失败）。现逻辑：在各段中匹配一个"已知英雄 key"（= `assets/champions/` 已下载文件名，`AssetManager.champion_keys()`），两种格式都命中，并带结构化兜底。
 - 召唤师技能：`summonerSpells` 的 `rawDisplayName`（英文 key）经 `_clean_spell_name` 关键词匹配。
 - **`position` 可用**：`allPlayers[].position` = `TOP/JUNGLE/MIDDLE/BOTTOM/UTILITY`（排位/征召可靠；盲选/练习可能为空）。用于自动识别上单（附赠 TP）。
+- **`level` 可用**：`allPlayers[].level`（每 2s 刷新）→ 估算大招等级。
 - **敌方符文只暴露 keystone + 主副系**（`allPlayers[].runes` 无小符文）。星界洞悉是小符文 → **读不到**，只能手动开关。仅 `activePlayer.fullRunes` 有自己的小符文。
+- **敌方无 `championStats`**：拿不到敌方总 AH（只有 `activePlayer.championStats.abilityHaste` 是自己的）→ 大招 AH 只能从 `items` 反推（漏符文 AH）。
 
 ### CD 计算
 - 公式：`实际CD = 基础CD × 100 / (100 + 召唤师技能急速)`。
@@ -38,7 +41,20 @@
 - **星界洞悉（`COSMIC_HASTE=18`）**：接口读不到敌方小符文，故做**每敌手动开关**——行尾一个星界洞悉眼睛图标（`assets/runes/CosmicInsight.png`，来自 CommunityDragon），左键点亮 = 该敌全部技能 +18。复现游戏内 tab tooltip（闪现 300/1.18=254.24s）。
 - **上单附赠 Unleashed Teleport（`UNLEASHED_TP_CD=420`）**：2026 上单任务奖励。若上单**没**原生 TP → 自动加第 3 个 TP 按钮（420s 定值，不随等级）；若**有**原生 TP → 任务只强化（加护盾），不加按钮。`position=="TOP"` 自动判定；盲选等 position 为空时**右键英雄头像**手动加/减（`_toggle_tp`，用 pack/pack_forget 不重建、保住计时）。
 - 基础 CD 启动时由 `DDragonManager` 从 `summoner.json` 拉取覆盖硬编码值。闪现 = 300s。
-- `SpellTimerWidget` 支持 `base_cd`（绕过 `SPELL_TIMERS`，用于 420）+ `icon_name`（复用 TP 图标）。
+- `SpellTimerWidget` 支持 `base_cd`（绕过 `SPELL_TIMERS`，用于 420）+ `icon_name` + `folder` + `r_cds` + `use_ability_haste`。
+
+### 大招（R）CD
+- **两种急速不能混**：召唤师技能吃「召唤师技能急速」（靴子/星界洞悉）；大招吃「技能急速 Ability Haste」（装备/符文），是**另一套数值**。代码里 `get_haste`（召唤师）与 `get_ability_haste`（大招）分开。
+- 每个敌人头像右侧加一个 **R 按钮**（`AbilityData.r_info` 有数据才加）：
+  - **基础 CD 按等级估**：点击时读敌方**实时** `level`，`rank_from_level` 映射 6/11/16 → 1/2/3 级（<6 不触发）。玩家几乎必到点点 R，够准。
+  - **Ability Haste 自动读装备**：敌方 `items` 的 itemID → `item_ah.json` 求和（`parse_enemies` 里算进 `ability_haste`）。
+  - 公式同：`R实际CD = R基础[级] × 100 / (100 + AH)`。
+- **数据来源（`download_assets.py` 阶段快照到本地，运行时不联网）**：
+  - `assets/abilities/<R>.png`：R 图标（DDragon `championFull.json` 的 `spells[3].image.full`）。
+  - `assets/abilities/r_index.json`：`{英雄key: {"icon": 文件, "cd": [1,2,3级]}}`。
+  - `assets/abilities/item_ah.json`：`{itemId: abilityHaste}`（**Meraki** 静态数据；DDragon/CDragon 不干净地暴露 AH）。
+  - `AbilityData.load()` 在 `__main__` 里读这两份 JSON；缺文件则自动降级（不加 R 按钮）。
+- **局限**：① 符文/其它 AH（超然 +5 等）读不到 → 少算、CD 偏长；② 重置/充能/变身类大招（诺手/卡特/沃利贝尔…）不符合 base×haste 模型，倒计时不准。R 计时器对**固定 CD 团战大招**最有用。
 
 ### 窗口（已去 overlay）
 - 普通 tkinter 窗口：有标题栏、进任务栏、**不透明**。
@@ -69,7 +85,7 @@
 | 文件 | 作用 |
 |---|---|
 | `main.py` | 主程序（数据轮询 + UI + 计时） |
-| `download_assets.py` | 从 DDragon 下载英雄/技能图标到 `assets/` |
+| `download_assets.py` | 从 DDragon 下载英雄/技能/大招图标到 `assets/`，并生成 `abilities/r_index.json`、`abilities/item_ah.json`（Meraki） |
 | `make_icon.py` | 程序化生成应用图标 `ico/icon.ico` |
 | `start.bat` | 启动器（`pythonw` 无黑窗，`%~dp0` 可移植） |
 | `setup.bat` / `requirements.txt` | 环境（requests / urllib3 / Pillow / pystray） |
