@@ -17,7 +17,7 @@
 - ✅ 已提交私有仓库 `anoymcat/xd-timer`。
 - ✅ 头像加载修复：`rawChampionName` 存在两种格式，改用 `_resolve_champ_name` 解析（见 §3）。
 - ✅ 置顶可开关（默认开，托盘切换，存 config）。
-- ✅ 星界洞悉手动开关（每敌 +18，眼睛图标切换）+ 上单附赠 Unleashed Teleport（420s）自动/手动按钮。
+- ✅ 星界洞悉手动开关（每敌 +18，眼睛图标切换）+ 上单附赠 Unleashed Teleport 自动/手动按钮（26.19 起 390s）。
 - ✅ DPI 感知 + 托盘比例缩放（50–200%）+ 海克斯金双线边框。
 - ✅ 大招（R）计时：R 图标 + 按等级估基础 CD + 自动吃装备 Ability Haste（见 §3 大招 R CD）。
 - ✅ 计时状态模型（`timer_core.py`）：按游戏时间（`gameData.gameTime`）计时；改缩放不再丢计时 / 星界 / TP 开关。单元测试 `tests/`。
@@ -47,7 +47,7 @@
 - **有效急速 = 靴子急速（API 自动） + 星界洞悉（手动 +18）**（`get_haste`）。靴子：`3158→10`、`3171→20`、`223158→10`（Arena），从 `items` 读。
 - **星界洞悉（`COSMIC_HASTE=18`）**：接口读不到敌方小符文，故做**每敌手动开关**——行尾一个星界洞悉眼睛图标（`assets/runes/CosmicInsight.png`，来自 CommunityDragon），左键点亮 = 该敌全部技能 +18。复现游戏内 tab tooltip（闪现 300/1.18=254.24s）。
 - **原生 TP（`timer_core.teleport_cd`）**：10:00 前 360s；10:00 起升级为 Unleashed Teleport，CD 按等级 330→240，上单（`position=="TOP"`）用任务强化后的 300→210（26.19）。等级插值按 1→18 线性 [需核实]；上单在 10:00 前完成任务时的强化未建模。
-- **上单附赠 Unleashed Teleport（`UNLEASHED_TP_CD=390`，26.19 由 420 下调）**：2026 上单任务奖励。若上单**没**原生 TP → 自动加第 3 个 TP 按钮（420s 定值，不随等级）；若**有**原生 TP → 任务只强化（加护盾），不加按钮。`position=="TOP"` 自动判定；盲选等 position 为空时**右键英雄头像**手动加/减（`_toggle_tp`，用 pack/pack_forget 不重建、保住计时）。
+- **上单附赠 Unleashed Teleport（`UNLEASHED_TP_CD=390`，26.19 由 420 下调）**：2026 上单任务奖励。若上单**没**原生 TP → 自动加第 3 个 TP 按钮（390s 定值，不随等级）；若**有**原生 TP → 任务只强化（加护盾），不加按钮。`position=="TOP"` 自动判定；盲选等 position 为空时**右键英雄头像**手动加/减（`_toggle_tp`，用 pack/pack_forget 不重建、保住计时）。
 - 基础 CD 启动时由 `DDragonManager` 从 `summoner.json` 拉取覆盖硬编码值。闪现 = 300s。
 - `SpellTimerWidget` 支持 `base_cd`（绕过 `SPELL_TIMERS`，用于 390）+ `icon_name` + `folder` + `r_cds` + `use_ability_haste`。
 
@@ -84,7 +84,7 @@
 
 ### 清晰度 / 缩放 / 边框
 - **DPI 感知**：`_enable_dpi_awareness()` 在 `Tk()` **之前**调 `SetProcessDpiAwarenessContext(-4)`（Per-Monitor v2，带旧系统兜底）→ 原生像素渲染，避免 HiDPI 位图拉伸发虚。圆头像遮罩 4× 超采样抗锯齿；计时字体用像素制（负值）。
-- **比例缩放**：托盘 `Scale` 子菜单 50/75/100/125/150/175/200%，存 `config.json` 的 `scale`。尺寸从 `BASE_ICON_SIZE`/`BASE_EYE_SIZE` × scale + `Config.s(v)` 派生；切换 `_set_scale`→`_rebuild_all`（重建窗口，**会重置正在跑的计时和当局星界/TP 开关**，属赛前操作可接受）。
+- **比例缩放**：托盘 `Scale` 子菜单 50/75/100/125/150/175/200%，存 `config.json` 的 `scale`。尺寸从 `BASE_ICON_SIZE`/`BASE_EYE_SIZE` × scale + `Config.s(v)` 派生；切换 `_set_scale`→`_rebuild_all`（重建窗口；计时在 `TimerModel`、星界 / TP 开关在 app 上，`reset_state=False` 时均保留）。
 - **海克斯金双线边框**：`_build_shell()` 用嵌套帧（父帧 bg 当"线"色，子帧 pack padx 露出）：金亮外线→深色护城河→暗金内线→深蓝面板。配色 `COLOR_GOLD`/`COLOR_GOLD_DIM`/`COLOR_MOAT`。真圆角/去标题栏需透明窗口那套 = overlay 特征，故不做，走矩形。
 
 ### 触发
@@ -133,6 +133,6 @@
 ## 9. 便携版打包（`make_portable.py`）
 
 - 目标：解压即用，目标机**无需装 Python**；双击 `DeskTimer.vbs`（无黑窗）或 `DeskTimer.bat` 即运行。
-- 做法：用 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 的 `install_only` Windows x64 完整发行版（**含 tkinter**，官方 embeddable 版**不含** tkinter，不可用）解压到 `python/`，`python/python.exe -m pip install -r requirements.txt`，再拷入 `main.py`/`download_assets.py`/`assets/`/`ico/` 等，生成启动器，打 zip。
+- 做法：用 [python-build-standalone](https://github.com/astral-sh/python-build-standalone) 的 `install_only` Windows x64 完整发行版（**含 tkinter**，官方 embeddable 版**不含** tkinter，不可用）解压到 `python/`，`python/python.exe -m pip install -r requirements.txt`，再拷入 `main.py`/`timer_core.py`/`download_assets.py`/`assets/`/`ico/` 等，生成启动器，打 zip。
 - 合规：解释器是官方签名 `python.exe`，跑的是 `.py` 源码，**非 PyInstaller 编译 exe**，符合 §4「跑源码不打包」。杀软仍可能对"便携 Python + 读游戏数据脚本"启发式报警，自用可接受。
 - `assets/` 需先 `download_assets.py` 生成好再打包，便携版即可离线启动（DDragon 更新失败会回退硬编码 CD）。
