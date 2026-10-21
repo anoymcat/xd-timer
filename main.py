@@ -575,6 +575,22 @@ class _Win32:
         return buf.value == Config.GAME_WINDOW_TITLE
 
     @classmethod
+    def describe_foreground(cls) -> Optional[Tuple[int, str, str]]:
+        """(hwnd, class, title) of the foreground window, for DESKTIMER_DEBUG logs."""
+        u = cls._api()
+        if u is None:
+            return None
+        try:
+            fg = u.GetForegroundWindow() or 0
+            cls_buf = ctypes.create_unicode_buffer(256)
+            title_buf = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(fg, cls_buf, 256)
+            u.GetWindowTextW(fg, title_buf, 256)
+            return fg, cls_buf.value, title_buf.value
+        except Exception:
+            return None
+
+    @classmethod
     def game_foreground_on_same_monitor(cls, root: tk.Tk) -> bool:
         """True if the game window is foreground and on the same monitor as `root`.
         Any failure -> False (window stays usable, i.e. old behaviour)."""
@@ -615,6 +631,7 @@ class OverlayApp:
         self._timer_widgets: List[SpellTimerWidget] = []
         self._debug_t0 = None     # DEBUG_DUMMY: fake game clock origin
         self._locked = False      # in-game lock (Tk -disabled) currently applied
+        self._last_fg = None      # DEBUG_DUMMY: last logged foreground hwnd
 
         # Per-enemy manual modifiers (reset each game):
         self.cosmic_toggle = {}   # champ -> bool: apply +18 haste (Cosmic Insight)
@@ -755,11 +772,18 @@ class OverlayApp:
 
     # --- In-game lock ---
     def _update_lock(self):
+        if Config.DEBUG_DUMMY:
+            # Log foreground changes so a wrong GAME_WINDOW_CLASS / TITLE is easy to spot.
+            fg = _Win32.describe_foreground()
+            if fg and fg[0] != self._last_fg:
+                self._last_fg = fg[0]
+                print(f"[Lock] foreground class={fg[1]!r} title={fg[2]!r}")
         self._set_locked(self.lock_over_game and _Win32.game_foreground_on_same_monitor(self.root))
 
     def _set_locked(self, locked: bool):
         if locked == self._locked: return
         self._locked = locked
+        print(f"[Lock] {'locked (game focused)' if locked else 'unlocked'}")
         try:
             self.root.wm_attributes("-disabled", locked)
         except tk.TclError:
