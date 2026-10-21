@@ -26,8 +26,10 @@
 - ✅ 原生 TP 按游戏时间 + 等级算 CD；上单任务 TP 改 390s（26.19）。
 - ✅ 资源过期提示（`assets/version.txt` vs DDragon 最新版，托盘显示）。
 - ✅ 游戏前台自动禁用实测通过（2026-10-21，Windows + 自定义对局）：窗口识别规则命中，游戏前台锁定、Alt-Tab 解锁均正常。
+- ✅ 主屏外观（2026-10-21，用户选方案 B）：`-alpha` 半透明（托盘 Opacity，默认 80%，**不**点击穿透）+ DWM 深蓝标题栏 / 金色边框 + 紧凑布局（托盘 Compact layout，默认开）+ 冷却扇形遮罩。调试模式截图确认，**待进游戏实测**。
+- ✅ `download_assets.py`：图片只补缺失，JSON 每次重建，`--force` 全量重下。
+- ⚠️ 正式对局中锁定未生效（点窗口会计时、QWER 失灵；2026-10-21 用户反馈）。自定义对局实测是正常的。待用户提供 `DESKTIMER_DEBUG=1` 下的 `[Lock]` 日志定位。
 - ⏳ 未实测：TP 等级插值是否与游戏内 tooltip 一致。
-- ⏳ 待改：`download_assets.py` 在游戏版本变化时会强制重下全部图标（`force_update`），版本小更新也全量下载。
 - ⏳ 未实测：真实"靴子 haste"套用（测试时 AI 未出明朗之靴；公式与逻辑已确认）。
 
 ## 3. 架构与关键实现
@@ -54,7 +56,8 @@
 - `SpellTimerWidget` 支持 `base_cd`（绕过 `SPELL_TIMERS`，用于 390）+ `icon_name` + `folder` + `r_cds` + `use_ability_haste`。
 
 ### 计时状态与显示（`timer_core.py`）
-- `TimerModel`：`(英雄, 槽位)` → 就绪时刻（游戏秒），槽位 = `S1` / `S2` / `R` / `UTP`。控件不存状态，`OverlayApp._ui_tick`（每 200ms）统一按模型重绘，所以重建窗口不丢计时。
+- `TimerModel`：`(英雄, 槽位)` → 就绪时刻（游戏秒）+ 总 CD，槽位 = `S1` / `S2` / `R` / `UTP`。控件不存状态，`OverlayApp._ui_tick`（每 200ms）统一按模型重绘，所以重建窗口不丢计时。
+- **冷却遮罩**：图标上的暗色扇形随剩余比例（`TimerModel.fraction`）从 12 点方向顺时针收缩，同游戏内；两种显示模式都有（报点模式的数字本身不动，靠遮罩看出在走）。`sweep_step` 分 60 档，`AssetManager.sweep_layer` 按 (尺寸, 档) 缓存 PIL 生成的 RGBA 图。补记 / 滚轮只移就绪时刻，总 CD 不变（推迟超过总 CD 时遮罩封顶为满）。
 - 显示方式（`config.json` 的 `display_mode`，托盘 Display 切换）：`ready` = 就绪时刻（游戏时钟 mm:ss，向上取整，符合聊天报点习惯），`countdown` = 剩余秒数。
 - 补记（录入总比实际施放晚）：左键 = 现在 − `reaction_delay`（默认 3s）；Shift+左键 = 现在 − `late_offset`（默认 20s，打完团才想起来）；运行中的计时器上滚轮每格 ±5s（上 = 推迟，下 = 提前）；右键重置。前两个值可在 `config.json` 改。滚轮用 `bind_all` + `winfo_containing` 分发到指针下的控件。
 - `timer_core.py` 不依赖 tkinter / Win32，测试：`python -m unittest discover -s tests`。
@@ -73,20 +76,23 @@
 - **局限**：① 符文/其它 AH（超然 +5 等）读不到 → 少算、CD 偏长；② 重置/充能/变身类大招（诺手/卡特/沃利贝尔…）不符合 base×haste 模型，倒计时不准。R 计时器对**固定 CD 团战大招**最有用。
 
 ### 窗口（已去 overlay）
-- 普通 tkinter 窗口：有标题栏、进任务栏、**不透明**。可放副屏，也可拖到主屏游戏之上（游戏需无边框模式）。
-- 已移除且**不再加回**：`overrideredirect(True)`、`wm_attributes("-alpha")`；以及 Win32 的 `WS_EX_NOACTIVATE`、`_apply_native_styles`。这三者 + 覆盖游戏才是反作弊盯的 overlay 特征组合。
+- 普通 tkinter 窗口：有标题栏、进任务栏、**半透明**（见下）。可放副屏，也可拖到主屏游戏之上（游戏需无边框模式）。
+- 已移除且**不再加回**：`overrideredirect(True)`；以及 Win32 的 `WS_EX_NOACTIVATE`、`_apply_native_styles`。
+- **`-alpha` 已加回（2026-10-21，用户在三个方案中明确选了 B）**：托盘 Opacity 100/90/80/70/60%，默认 80%，存 `config.json` 的 `alpha`。只做半透明，**不**点击穿透：看得见下面的地面，但点击到不了游戏。代价：置顶 + 半透明 + 覆盖游戏比不透明窗口更接近 overlay 特征，被反作弊注意的风险高于原方案，用户已知悉。被否决的方案 C（`-alpha` + `WS_EX_TRANSPARENT` 点击穿透）与外部透视外挂窗口形态一致，**不做**。
+- **标题栏配色（`_Dwm.style_title_bar`）**：对自身 `wm_frame()` hwnd 调 `DwmSetWindowAttribute`：深色模式（20，旧版 19）、标题栏色 35 = `COLOR_BG`、边框色 34 = `COLOR_GOLD`、标题文字色 36（34–36 需 Win11 22000+）。只改自己窗口，失败静默降级。每次显示窗口时（`_apply_window_attrs`）套用。
+- **紧凑布局（托盘 "Compact layout"，默认开，存 `compact`）**：`Config.LAYOUTS` 两套基础尺寸——普通 38px 图标 / 22px 眼睛 / 有分隔线 / 有拖动把手；紧凑 26px / 16px / 无分隔线 / 无把手 / 间距 ×0.5（`Config.g`）。再乘托盘缩放比例。紧凑模式用原生标题栏拖动；pin 移到托盘 "Pin position"（普通模式右键把手也可切换），pin 住时标题栏拖动后 300ms 弹回原位（`_on_configure`；不子类化窗口过程，所以挡不住拖动本身）。位置由 `<Configure>` 记录。窗口 `resizable(False, False)`。
 - **`-topmost` 已加回**（可开关，默认开，状态存 `config.json` 的 `topmost` 字段）：托盘菜单 "Always on Top" 勾选切换（`_toggle_topmost` / `_apply_topmost`），显示窗口时（`deiconify` 后）套用。置顶只改自身窗口 Z 序、不接触游戏进程。
 - **游戏前台自动禁用（`-disabled`，托盘 "Lock while game focused"，默认开，存 `lock_over_game`）**：放在主屏游戏之上时，非点击穿透的窗口被点到就会被激活、抢走游戏键盘焦点。故当游戏窗口在前台**且**本窗口与游戏在同一显示器时，用 Tk 自带 `wm_attributes("-disabled", True)` 禁用窗口：点击无响应、不抢焦点、不改计时（该区域的点击仍不会传给游戏）。Alt-Tab 出去（游戏不在前台）即恢复可点、可拖动。外线金边亮 = 可用，暗 = 禁用。
   - 检测只**读**窗口信息（`_Win32`：`GetForegroundWindow` + `GetClassNameW` / `GetWindowTextW` + `MonitorFromWindow`），不打开游戏进程、不改任何窗口样式；用轮询而非系统事件回调。游戏窗口识别：类名 `RiotWindowClass` 或标题 `League of Legends (TM) Client`（已实测命中）。任何失败都返回"未锁定"（= 旧行为）。`DESKTIMER_DEBUG=1` 时控制台会打印每次前台窗口切换的类名 / 标题，用于核对识别规则。
   - 窗口在副屏时不锁（不同显示器），保持直接点击的旧用法。
-- 仍**不加**：`overrideredirect`、`-alpha` / 色键透明、`WS_EX_NOACTIVATE`、点击穿透（`WS_EX_TRANSPARENT`）。半透明 + 置顶 + 点击穿透 + 覆盖游戏 = 外部透视外挂窗口的典型形态。
+- 仍**不加**：`overrideredirect`、色键透明（`-transparentcolor`）、`WS_EX_NOACTIVATE`、`WS_EX_TOOLWINDOW`、点击穿透（`WS_EX_TRANSPARENT`）。半透明 + 置顶 + 点击穿透 + 覆盖游戏 = 外部透视外挂窗口的典型形态；现在已有前三项，点击穿透是最后一道线。
 - pystray 回调在托盘线程，切换置顶经 `root.after(0, ...)` 回到 UI 线程执行。**注意 pystray MenuItem 的 action/checked lambda 参数个数 ≤2**（含默认参数也计数，超了启动即 `ValueError`；用闭包捕获值，别加 `v=val` 默认参）。
 - 保留：自定义拖动把手、pin、`config.json` 记忆位置、系统托盘退出、单实例 mutex。
 - `DEBUG_DUMMY`（环境变量 `DESKTIMER_DEBUG=1`）：无对局时也显示 dummy 敌方，便于离线调试窗口形态。
 
 ### 清晰度 / 缩放 / 边框
 - **DPI 感知**：`_enable_dpi_awareness()` 在 `Tk()` **之前**调 `SetProcessDpiAwarenessContext(-4)`（Per-Monitor v2，带旧系统兜底）→ 原生像素渲染，避免 HiDPI 位图拉伸发虚。圆头像遮罩 4× 超采样抗锯齿；计时字体用像素制（负值）。
-- **比例缩放**：托盘 `Scale` 子菜单 50/75/100/125/150/175/200%，存 `config.json` 的 `scale`。尺寸从 `BASE_ICON_SIZE`/`BASE_EYE_SIZE` × scale + `Config.s(v)` 派生；切换 `_set_scale`→`_rebuild_all`（重建窗口；计时在 `TimerModel`、星界 / TP 开关在 app 上，`reset_state=False` 时均保留）。
+- **比例缩放**：托盘 `Scale` 子菜单 50/75/100/125/150/175/200%，存 `config.json` 的 `scale`。尺寸从当前布局（普通 / 紧凑，`Config.apply_layout`）的 `BASE_ICON_SIZE`/`BASE_EYE_SIZE` × scale + `Config.s(v)` / `Config.g(v)` 派生；切换 `_set_scale` / `_set_compact`→`_rebuild_all`（重建窗口；计时在 `TimerModel`、星界 / TP 开关在 app 上，`reset_state=False` 时均保留）。
 - **海克斯金双线边框**：`_build_shell()` 用嵌套帧（父帧 bg 当"线"色，子帧 pack padx 露出）：金亮外线→深色护城河→暗金内线→深蓝面板。配色 `COLOR_GOLD`/`COLOR_GOLD_DIM`/`COLOR_MOAT`。真圆角/去标题栏需透明窗口那套 = overlay 特征，故不做，走矩形。
 
 ### 触发
@@ -95,7 +101,7 @@
 ## 4. 设计约束（安全 / 合规）
 
 - 仅用官方本地 API；**不**读内存、注入、挂钩、截屏、发送输入。
-- 普通窗口；可放在主屏游戏之上，但游戏在前台时自动禁用，不加透明 / 点击穿透 / 不激活等 overlay 样式（见 §3 窗口）。
+- 普通窗口；可放在主屏游戏之上，但游戏在前台时自动禁用。已按用户选择加入 `-alpha` 半透明；仍不加点击穿透 / 不激活 / 无边框等 overlay 样式（见 §3 窗口）。
 - **跑源码，不打包 exe**（避免未签名 exe 被杀软误报 / 特征匹配）。便携分发用「便携版 Python + 源码」（官方签名 `python.exe` 解释 `.py`，**非** PyInstaller 编译），仍守此约束。见 §9。
 - 进程（`pythonw.exe`）、窗口标题、托盘、mutex 命名均中性。
 - 不用于腾讯服务器；自用、不分发。
@@ -108,7 +114,7 @@
 | `main.py` | 主程序（数据轮询 + UI + 托盘 + 游戏前台禁用） |
 | `timer_core.py` | 计时核心：游戏时钟、计时状态模型、CD / 急速 / TP / 格式化函数（无 UI 依赖） |
 | `tests/` | `timer_core` 单元测试（`python -m unittest discover -s tests`） |
-| `download_assets.py` | 从 DDragon 下载英雄/技能/大招图标到 `assets/`，并生成 `abilities/r_index.json`、`abilities/item_ah.json`（Meraki） |
+| `download_assets.py` | 从 DDragon 下载英雄/技能/大招图标到 `assets/`（只补缺失，`--force` 全量），并每次重建 `abilities/r_index.json`、`abilities/item_ah.json`（Meraki） |
 | `make_icon.py` | 程序化生成应用图标 `ico/icon.ico` |
 | `start.bat` | 启动器（`pythonw` 无黑窗，`%~dp0` 可移植） |
 | `setup.bat` / `requirements.txt` | 环境（requests / urllib3 / Pillow / pystray） |

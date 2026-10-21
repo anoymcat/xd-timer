@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from timer_core import (GameClock, TimerModel, apply_haste, rank_from_level,
-                        level_scaled, teleport_cd, fmt_countdown, fmt_clock)
+                        level_scaled, teleport_cd, sweep_step, fmt_countdown, fmt_clock)
 
 
 class FakeMono:
@@ -63,6 +63,19 @@ class TestTimerModel(unittest.TestCase):
         m.adjust(k, 5)  # no-op on idle key
         self.assertFalse(m.is_active(k))
 
+    def test_fraction(self):
+        m = TimerModel()
+        k = ("Darius", "S1")
+        self.assertIsNone(m.fraction(k, 0))
+        m.start(k, 300, used_at=600)
+        self.assertAlmostEqual(m.fraction(k, 600), 1.0)
+        self.assertAlmostEqual(m.fraction(k, 750), 0.5)
+        self.assertEqual(m.fraction(k, 1000), 0.0)
+        m.adjust(k, 60)  # wheel: ready later than a full CD -> capped
+        self.assertEqual(m.fraction(k, 600), 1.0)
+        m.reset(k)
+        self.assertIsNone(m.fraction(k, 600))
+
     def test_keys_independent(self):
         m = TimerModel()
         m.start(("A", "S1"), 300, 0)
@@ -94,6 +107,15 @@ class TestCooldowns(unittest.TestCase):
         self.assertEqual(teleport_cd(600, 18, False), 240)
         self.assertEqual(teleport_cd(600, 1, True), 300)
         self.assertEqual(teleport_cd(600, 18, True), 210)
+
+
+class TestSweep(unittest.TestCase):
+    def test_sweep_step(self):
+        self.assertEqual(sweep_step(1.0, 60), 60)
+        self.assertEqual(sweep_step(0.5, 60), 30)
+        self.assertEqual(sweep_step(0.001, 60), 1)   # still cooling -> visible
+        self.assertEqual(sweep_step(0.0, 60), 0)
+        self.assertEqual(sweep_step(-0.1, 60), 0)
 
 
 class TestFormat(unittest.TestCase):

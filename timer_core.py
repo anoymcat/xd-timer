@@ -49,13 +49,16 @@ class GameClock:
 
 
 class TimerModel:
-    """key = (champ, slot)，slot 如 "S1" / "S2" / "R" / "UTP"。值 = 就绪时刻（游戏秒）。"""
+    """key = (champ, slot)，slot 如 "S1" / "S2" / "R" / "UTP"。值 = 就绪时刻（游戏秒）。
+    另记总 CD（用于冷却遮罩的剩余比例）；补记 / 滚轮只移动就绪时刻，总 CD 不变。"""
 
     def __init__(self):
         self._ready: Dict[Tuple[str, str], float] = {}
+        self._total: Dict[Tuple[str, str], float] = {}
 
     def start(self, key, cooldown: float, used_at: float):
         self._ready[key] = used_at + cooldown
+        self._total[key] = float(cooldown)
 
     def adjust(self, key, delta: float):
         if key in self._ready:
@@ -63,9 +66,19 @@ class TimerModel:
 
     def reset(self, key):
         self._ready.pop(key, None)
+        self._total.pop(key, None)
 
     def clear(self):
         self._ready.clear()
+        self._total.clear()
+
+    def fraction(self, key, now: float) -> Optional[float]:
+        """剩余比例 0..1（1 = 刚施放）；滚轮推迟超过总 CD 时封顶为 1。"""
+        r = self._ready.get(key)
+        total = self._total.get(key)
+        if r is None or not total:
+            return None
+        return min(max((r - now) / total, 0.0), 1.0)
 
     def is_active(self, key) -> bool:
         return key in self._ready
@@ -106,6 +119,14 @@ def teleport_cd(game_time: float, level: int, is_top: bool) -> float:
         return float(TP_BASE_CD)
     start, end = TP_UNLEASHED_CD_TOP if is_top else TP_UNLEASHED_CD
     return level_scaled(start, end, level)
+
+
+def sweep_step(fraction: float, steps: int) -> int:
+    """冷却遮罩分档：剩余比例 -> 0..steps（向上取整，只要还在冷却就至少 1 档）。
+    遮罩图按档缓存，不必每次重绘都重新生成。"""
+    if fraction <= 0:
+        return 0
+    return min(steps, math.ceil(fraction * steps))
 
 
 def fmt_countdown(remaining: float) -> str:

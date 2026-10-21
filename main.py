@@ -13,7 +13,7 @@ import urllib3
 from PIL import Image, ImageTk, ImageDraw, ImageOps
 import pystray 
 from timer_core import (GameClock, TimerModel, apply_haste, rank_from_level as _rank_from_level,
-                        teleport_cd, fmt_countdown, fmt_clock)
+                        teleport_cd, sweep_step, fmt_countdown, fmt_clock)
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -107,12 +107,27 @@ class Config:
     }
     
     # === VISUALS ===
-    GLOBAL_OPACITY = 0.85
+    # Window opacity (Tk "-alpha"), user-selectable in the tray. Semi-transparent but
+    # NOT click-through (no WS_EX_TRANSPARENT) — see CLAUDE.md §3 窗口.
+    DEFAULT_ALPHA = 0.8
+    ALPHA_CHOICES = (100, 90, 80, 70, 60)  # percent
+    SWEEP_STEPS = 60        # cooldown mask: angle buckets (cached images per size)
+
+    # --- Layout ---
+    # "normal" = desk / second-screen layout; "compact" = main-screen layout next to
+    # the game (smaller icons, no separators, no drag handle -> move by title bar).
+    # gap = multiplier for paddings between icons / rows.
+    LAYOUTS = {
+        False: {"icon": 38, "eye": 22, "row_pad": 6, "sep": True,  "gap": 1.0},
+        True:  {"icon": 26, "eye": 16, "row_pad": 2, "sep": False, "gap": 0.5},
+    }
+    COMPACT = False
     SHOW_SEPARATOR = True
+    GAP = 1.0
 
     # --- Scaling ---
-    # BASE_* are the 100% design sizes (px). Effective sizes below are recomputed by
-    # apply_scale(). DPI awareness (see _enable_dpi_awareness) keeps them crisp.
+    # BASE_* are the 100% design sizes (px) of the current layout. Effective sizes are
+    # recomputed by apply_scale(). DPI awareness (see _enable_dpi_awareness) keeps them crisp.
     BASE_ICON_SIZE = 38
     BASE_EYE_SIZE = 22      # Cosmic Insight toggle icon (smaller than spell icons)
     SCALE = 1.0
@@ -138,6 +153,17 @@ class Config:
     BASE_FONT_SIZE = 12
 
     @classmethod
+    def apply_layout(cls, compact: bool):
+        lay = cls.LAYOUTS[bool(compact)]
+        cls.COMPACT = bool(compact)
+        cls.BASE_ICON_SIZE = lay["icon"]
+        cls.BASE_EYE_SIZE = lay["eye"]
+        cls.ROW_PADDING_Y = lay["row_pad"]
+        cls.SHOW_SEPARATOR = lay["sep"]
+        cls.GAP = lay["gap"]
+        cls.apply_scale(cls.SCALE)
+
+    @classmethod
     def apply_scale(cls, scale: float):
         cls.SCALE = scale
         cls.ICON_SIZE = max(1, round(cls.BASE_ICON_SIZE * scale))
@@ -147,6 +173,11 @@ class Config:
     def s(cls, v) -> int:
         """Scale a base pixel/padding value by the current SCALE (min 1)."""
         return max(1, round(v * cls.SCALE))
+
+    @classmethod
+    def g(cls, v) -> int:
+        """Gap between icons / rows: scaled, and shrunk in the compact layout."""
+        return cls.s(v * cls.GAP)
     
     # API URLs
     LCL_URL = "https://127.0.0.1:2999/liveclientdata/allgamedata"
@@ -403,10 +434,35 @@ class AssetManager:
             img.putalpha(mask)
         return ImageTk.PhotoImage(img)
 
+    _sweep_cache: Dict[Tuple[int, int], ImageTk.PhotoImage] = {}
+
     @staticmethod
-    def create_dim_layer(size: Tuple[int, int]) -> ImageTk.PhotoImage:
-        img = Image.new("RGBA", size, (0, 0, 0, 180))
-        return ImageTk.PhotoImage(img)
+    def sweep_layer(size: int, step: int) -> ImageTk.PhotoImage:
+        """Cooldown mask like the in-game one: the remaining part (step/SWEEP_STEPS of
+        the circle, ending at 12 o'clock) is dark and shrinks clockwise as the CD runs;
+        the elapsed part is only lightly dimmed so the timer text stays readable.
+        Cached per (size, step) -> at most SWEEP_STEPS+1 images per icon size."""
+        key = (size, step)
+        img = AssetManager._sweep_cache.get(key)
+        if img is None:
+            img = ImageTk.PhotoImage(AssetManager.sweep_image(size, step))
+            AssetManager._sweep_cache[key] = img
+        return img
+
+    @staticmethod
+    def sweep_image(size: int, step: int) -> Image.Image:
+        ss = 4  # supersample for an anti-aliased edge
+        big = size * ss
+        layer = Image.new("RGBA", (big, big), (0, 0, 0, 70))
+        if step > 0:
+            # PIL angles: 0 = 3 o'clock, clockwise. Radius > half-diagonal so the
+            # wedge also covers the square icon's corners.
+            start = -90 + 360 * (1 - step / Config.SWEEP_STEPS)
+            r = big * 0.75
+            c = big / 2
+            ImageDraw.Draw(layer).pieslice((c - r, c - r, c + r, c + r),
+                                           start, 270, fill=(0, 0, 0, 185))
+        return layer.resize((size, size), Image.Resampling.LANCZOS)
 
     @staticmethod
     def load_toggle_pair(folder: str, name: str, size: Tuple[int, int]
@@ -443,12 +499,13 @@ class SpellTimerWidget(tk.Canvas):
         self.r_cds = r_cds               # ultimate: per-rank CDs; base picked by enemy level
         self.use_ability_haste = use_ability_haste  # R uses Ability Haste, not summoner haste
         self._text = None                # last drawn text (None = idle)
+        self._step = None                # last drawn cooldown-mask bucket
 
         self.icon_img = AssetManager.load_icon(folder, icon_name or spell_name, (Config.ICON_SIZE, Config.ICON_SIZE))
         self.create_image(0, 0, image=self.icon_img, anchor="nw")
-        
-        self.dim_img = AssetManager.create_dim_layer((Config.ICON_SIZE, Config.ICON_SIZE))
-        self.dim_id = self.create_image(0, 0, image=self.dim_img, anchor="nw", state="hidden")
+
+        # Cooldown mask (image swapped per sweep bucket in refresh); text is drawn above it.
+        self.dim_id = self.create_image(0, 0, anchor="nw", state="hidden")
 
         # Tk fires only the most specific binding, so Shift+click does NOT also fire <Button-1>.
         self.bind("<Button-1>", lambda e: self._start(self.app_ref.reaction_delay))
@@ -533,13 +590,20 @@ class SpellTimerWidget(tk.Canvas):
                 self.delete("timer_text")
                 self.itemconfig(self.dim_id, state="hidden")
                 self._text = None
+                self._step = None
             return
+        # The mask shows progress in both display modes (ready time itself is static).
+        step = sweep_step(timers.fraction(self.key, self.app_ref.clock.now()) or 0.0,
+                          Config.SWEEP_STEPS)
+        if step != self._step:
+            self.itemconfig(self.dim_id, image=AssetManager.sweep_layer(Config.ICON_SIZE, step),
+                            state="normal")
+            self._step = step
         if self.app_ref.display_mode == "ready":
             text = fmt_clock(timers.ready_at(self.key))
         else:
             text = fmt_countdown(remaining)
         if text != self._text:
-            self.itemconfig(self.dim_id, state="normal")
             self._draw_outlined_text(text)
             self._text = text
 
@@ -608,18 +672,57 @@ class _Win32:
         except Exception:
             return False
 
+# --- DWM (title bar colours of OUR OWN window) ---
+class _Dwm:
+    """Recolours this window's native title bar / border (no white strip on the main
+    screen). Only touches our own hwnd; any failure (older Windows) -> keep defaults."""
+    DWMWA_USE_IMMERSIVE_DARK_MODE = 20      # Win10 20H1+
+    DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19  # Win10 1809-1909
+    DWMWA_BORDER_COLOR = 34                 # Win11 22000+
+    DWMWA_CAPTION_COLOR = 35
+    DWMWA_TEXT_COLOR = 36
+
+    @staticmethod
+    def _colorref(hex_color: str) -> int:
+        r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+        return (b << 16) | (g << 8) | r     # COLORREF = 0x00BBGGRR
+
+    @classmethod
+    def style_title_bar(cls, root: tk.Tk):
+        try:
+            dwm = ctypes.windll.dwmapi
+            hwnd = ctypes.c_void_p(int(root.wm_frame(), 16))
+        except (AttributeError, OSError, ValueError, tk.TclError):
+            return
+
+        def set_attr(attr: int, value: int) -> bool:
+            v = ctypes.c_int(value)
+            try:
+                return dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v)) == 0
+            except OSError:
+                return False
+
+        if not set_attr(cls.DWMWA_USE_IMMERSIVE_DARK_MODE, 1):
+            set_attr(cls.DWMWA_USE_IMMERSIVE_DARK_MODE_OLD, 1)
+        set_attr(cls.DWMWA_CAPTION_COLOR, cls._colorref(Config.COLOR_BG))
+        set_attr(cls.DWMWA_BORDER_COLOR, cls._colorref(Config.COLOR_GOLD))
+        set_attr(cls.DWMWA_TEXT_COLOR, cls._colorref(Config.COLOR_TEXT_ACTIVE))
+
 # --- MAIN APP ---
 class OverlayApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("DeskTimer")
         self.root.configure(bg=Config.COLOR_BG)
-        # Normal desktop window: still NO overrideredirect / alpha / WS_EX_NOACTIVATE /
-        # click-through. Allowed: "-topmost" (user-toggleable, default on) and Tk's
-        # "-disabled" (in-game lock, see Config.GAME_WINDOW_CLASS). The window keeps its
-        # border, taskbar entry and is opaque; it may sit over the game on the main
-        # screen, but is disabled while the game is foreground so it never takes focus.
-        # Do NOT re-add the other overlay attributes — that combo is what anti-cheat flags.
+        self.root.resizable(False, False)
+        # Normal desktop window: still NO overrideredirect / WS_EX_NOACTIVATE /
+        # click-through. Allowed: "-topmost" (user-toggleable, default on), Tk's
+        # "-disabled" (in-game lock, see Config.GAME_WINDOW_CLASS), "-alpha" (user chose
+        # semi-transparency, tray Opacity) and DWM title-bar colours. The window keeps its
+        # title bar and taskbar entry; it may sit over the game on the main screen, but is
+        # disabled while the game is foreground so it never takes focus.
+        # Do NOT add click-through / no-activate / borderless — with alpha + topmost over
+        # the game that is exactly the overlay profile anti-cheat flags.
 
         self.game_active = False
         self.enemy_data_cache = {} # Cache to store fresh enemy data
@@ -649,12 +752,18 @@ class OverlayApp:
         self.scale = 1.0        # overwritten by _load_config
         self.display_mode = "ready"   # 'ready' (game-clock time) | 'countdown'
         self.lock_over_game = True
+        self.alpha = Config.DEFAULT_ALPHA
+        self.compact = True
         self.reaction_delay = Config.REACTION_DELAY
         self.late_offset = Config.LATE_OFFSET
         self._load_config()
         Config.apply_scale(self.scale)
+        Config.apply_layout(self.compact)
 
         self._drag_data = {"x": 0, "y": 0}
+        self._pin_snap_job = None
+        # Title-bar moves: remember the position (or snap back while pinned).
+        self.root.bind("<Configure>", self._on_configure)
 
         self.container = None
         self._build_shell()
@@ -692,14 +801,18 @@ class OverlayApp:
         self.inner.pack(padx=s(1), pady=s(1))
 
         content = tk.Frame(self.inner, bg=Config.COLOR_BG)
-        content.pack(padx=s(6), pady=s(5))
+        content.pack(padx=Config.g(6), pady=Config.g(5))
 
-        self.handle = tk.Label(content, text="::::", bg=Config.COLOR_BG, fg=Config.COLOR_HANDLE,
-                               font=(Config.FONT_FAMILY, -max(7, s(9)), "bold"), cursor="fleur")
-        self.handle.pack(fill="x", pady=(0, s(3)))
-        self.handle.bind("<ButtonPress-1>", self._start_drag)
-        self.handle.bind("<B1-Motion>", self._do_drag)
-        self.handle.bind("<Button-3>", self._toggle_pin)
+        # Drag handle only in the normal layout; compact moves by the native title bar
+        # (pin then lives in the tray, see _on_configure).
+        self.handle = None
+        if not Config.COMPACT:
+            self.handle = tk.Label(content, text="::::", bg=Config.COLOR_BG, fg=Config.COLOR_HANDLE,
+                                   font=(Config.FONT_FAMILY, -max(7, s(9)), "bold"), cursor="fleur")
+            self.handle.pack(fill="x", pady=(0, s(3)))
+            self.handle.bind("<ButtonPress-1>", self._start_drag)
+            self.handle.bind("<B1-Motion>", self._do_drag)
+            self.handle.bind("<Button-3>", self._toggle_pin)
         self._update_pin_visual()
 
         self.enemies_frame = tk.Frame(content, bg=Config.COLOR_BG)
@@ -714,13 +827,41 @@ class OverlayApp:
         self.root.after(0, self._rebuild_all)
         print(f"[Scale] {int(scale*100)}%")
 
+    def _set_compact(self, compact: bool):
+        """Tray callback: switch normal / compact layout and rebuild on the UI thread."""
+        self.compact = compact
+        Config.apply_layout(compact)
+        self._cosmic_on = self._cosmic_off = None  # force re-render at the new size
+        self._save_config()
+        self.root.after(0, self._rebuild_all)
+        print(f"[Layout] {'compact' if compact else 'normal'}")
+
     def _rebuild_all(self):
         self._build_shell()
         if self.game_active and self.enemy_data_cache:
             # Keep this game's timers / cosmic / TP toggles (state is not in the widgets).
             self._build_enemy_rows(list(self.enemy_data_cache.values()), reset_state=False)
         self.root.geometry(f"+{self.saved_x}+{self.saved_y}")
+        self._apply_window_attrs()
+
+    def _apply_window_attrs(self):
+        """Topmost + opacity + title-bar colours; called whenever the window is shown."""
         self._apply_topmost()
+        self._apply_alpha()
+        _Dwm.style_title_bar(self.root)
+
+    def _apply_alpha(self):
+        try:
+            self.root.wm_attributes("-alpha", float(self.alpha))
+        except Exception as e:
+            print(f"[Opacity] apply failed: {e}")
+
+    def _set_alpha(self, alpha: float):
+        # Called from the pystray thread -> marshal the Tk call onto the UI thread.
+        self.alpha = alpha
+        self.root.after(0, self._apply_alpha)
+        self._save_config()
+        print(f"[Opacity] {int(alpha*100)}%")
 
     def get_haste(self, champ_name: str) -> int:
         """Returns effective summoner-spell haste for a champion:
@@ -852,12 +993,33 @@ class OverlayApp:
             make_display_item("Countdown", "countdown"),
         )
 
+        def make_alpha_item(pct):
+            val = pct / 100.0  # closure, not a default arg (pystray argcount limit)
+            return pystray.MenuItem(
+                f"{pct}%",
+                lambda icon, item: self._set_alpha(val),
+                checked=lambda item: abs(self.alpha - val) < 1e-6,
+                radio=True,
+            )
+        alpha_menu = pystray.Menu(*[make_alpha_item(p) for p in Config.ALPHA_CHOICES])
+
         items = [
             pystray.MenuItem(
                 "Always on Top",
                 self._toggle_topmost,
                 checked=lambda item: self.is_topmost,
             ),
+            pystray.MenuItem(
+                "Compact layout",
+                lambda icon, item: self._set_compact(not self.compact),
+                checked=lambda item: self.compact,
+            ),
+            pystray.MenuItem(
+                "Pin position",
+                self._tray_toggle_pin,
+                checked=lambda item: self.is_pinned,
+            ),
+            pystray.MenuItem("Opacity", alpha_menu),
             pystray.MenuItem(
                 "Lock while game focused",
                 self._toggle_lock,
@@ -890,6 +1052,8 @@ class OverlayApp:
                     if data.get('display_mode') in ("ready", "countdown"):
                         self.display_mode = data['display_mode']
                     self.lock_over_game = data.get('lock_over_game', True)
+                    self.alpha = min(1.0, max(0.2, float(data.get('alpha', Config.DEFAULT_ALPHA))))
+                    self.compact = bool(data.get('compact', True))
                     self.reaction_delay = float(data.get('reaction_delay', Config.REACTION_DELAY))
                     self.late_offset = float(data.get('late_offset', Config.LATE_OFFSET))
                     print(f"[Config] Loaded: Pos({self.saved_x},{self.saved_y}), Pinned({self.is_pinned}), Topmost({self.is_topmost}), Scale({self.scale})")
@@ -909,6 +1073,8 @@ class OverlayApp:
             'scale': self.scale,
             'display_mode': self.display_mode,
             'lock_over_game': self.lock_over_game,
+            'alpha': self.alpha,
+            'compact': self.compact,
             'reaction_delay': self.reaction_delay,
             'late_offset': self.late_offset,
         }
@@ -941,16 +1107,38 @@ class OverlayApp:
         self._save_config()
         print(f"[Topmost] {'ON' if self.is_topmost else 'OFF'}")
 
-    def _toggle_pin(self, event):
+    def _toggle_pin(self, event=None):
         self.is_pinned = not self.is_pinned
         self._update_pin_visual()
         self._save_config()
 
+    def _tray_toggle_pin(self, icon=None, item=None):
+        self.root.after(0, self._toggle_pin)
+
     def _update_pin_visual(self):
+        self.root.title("DeskTimer (pinned)" if self.is_pinned else "DeskTimer")
+        if self.handle is None:
+            return
         if self.is_pinned:
             self.handle.config(text="🔒 PINNED", fg=Config.COLOR_PINNED, cursor="arrow")
         else:
             self.handle.config(text="::::", fg=Config.COLOR_HANDLE, cursor="fleur")
+
+    def _on_configure(self, event):
+        """Track title-bar moves. Pinned -> snap back shortly after the move (the OS
+        move loop can't be blocked without subclassing the window, which we don't do)."""
+        if event.widget is not self.root or self.root.state() != "normal":
+            return
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        if (x, y) == (self.saved_x, self.saved_y):
+            return
+        if self.is_pinned:
+            if self._pin_snap_job is not None:
+                self.root.after_cancel(self._pin_snap_job)
+            self._pin_snap_job = self.root.after(
+                300, lambda: self.root.geometry(f"+{self.saved_x}+{self.saved_y}"))
+        else:
+            self.saved_x, self.saved_y = x, y
 
     def _monitor_game_loop(self):
         data = GameDataManager.fetch_data()
@@ -979,7 +1167,8 @@ class OverlayApp:
                 self._build_enemy_rows(enemies)
                 self.root.deiconify()
                 self.root.geometry(f"+{self.saved_x}+{self.saved_y}")
-                self._apply_topmost()
+                self.root.update_idletasks()   # wrapper hwnd exists before DWM styling
+                self._apply_window_attrs()
                 self.game_active = True
 
             # NOTE: We do NOT rebuild UI in loop to preserve running timers.
@@ -1026,7 +1215,7 @@ class OverlayApp:
         for i, enemy in enumerate(enemies):
             if i > 0 and Config.SHOW_SEPARATOR:
                 sep = tk.Frame(self.enemies_frame, bg=Config.COLOR_SEPARATOR, height=s(1))
-                sep.pack(fill="x", padx=s(10), pady=s(2))
+                sep.pack(fill="x", padx=Config.g(10), pady=Config.g(2))
 
             row = tk.Frame(self.enemies_frame, bg=Config.COLOR_BG)
             row.pack(fill="x", pady=s(Config.ROW_PADDING_Y))
@@ -1035,7 +1224,7 @@ class OverlayApp:
             champ_icon = AssetManager.load_icon("champions", champ, (Config.ICON_SIZE, Config.ICON_SIZE), is_round=True)
             self._img_refs.append(champ_icon)
             lbl = tk.Label(row, image=champ_icon, bg=Config.COLOR_BG, bd=0)
-            lbl.pack(side="left", padx=(0, s(8)))
+            lbl.pack(side="left", padx=(0, Config.g(8)))
             # Right-click the portrait: manually add/remove the Unleashed TP button
             # (fallback for blind pick / modes where API 'position' is empty).
             lbl.bind("<Button-3>", lambda e, c=champ: self._toggle_tp(c))
@@ -1047,16 +1236,14 @@ class OverlayApp:
                 rw = SpellTimerWidget(row, champ, "R", "R", self, icon_name=r_icon,
                                       folder="abilities", r_cds=r_info['cd'],
                                       use_ability_haste=True)
-                rw.pack(side="left", padx=(0, s(6)))
+                rw.pack(side="left", padx=(0, Config.g(6)))
                 self._img_refs.append(rw.icon_img)
-                self._img_refs.append(rw.dim_img)
 
             for slot, s_name in (("S1", enemy['spell1']), ("S2", enemy['spell2'])):
                 # Pass 'self' (app) reference so the button can query cache
                 sw = SpellTimerWidget(row, champ, s_name, slot, self)
-                sw.pack(side="left", padx=s(3))
+                sw.pack(side="left", padx=Config.g(3))
                 self._img_refs.append(sw.icon_img)
-                self._img_refs.append(sw.dim_img)
 
             # --- Unleashed Teleport (top-lane role quest reward), created always,
             #     packed only when applicable; toggle preserves running timers. ---
@@ -1066,12 +1253,11 @@ class OverlayApp:
                                          base_cd=Config.UNLEASHED_TP_CD, icon_name="SummonerTeleport")
             self._tp_widgets[champ] = tp_widget
             self._img_refs.append(tp_widget.icon_img)
-            self._img_refs.append(tp_widget.dim_img)
 
             # --- Cosmic Insight toggle (far right, small). Off by default. ---
             eye_img = self._cosmic_on if self.cosmic_toggle.get(champ) else self._cosmic_off
             eye = tk.Label(row, image=eye_img, bg=Config.COLOR_BG, bd=0, cursor="hand2")
-            eye.pack(side="left", padx=(s(8), 0))
+            eye.pack(side="left", padx=(Config.g(8), 0))
             eye.bind("<Button-1>", lambda e, c=champ: self._toggle_cosmic(c))
             self._eye_widgets[champ] = eye
 
@@ -1079,7 +1265,7 @@ class OverlayApp:
             # (on a rebuild, keep whatever the user had toggled).
             show_tp = prev_tp_shown.get(champ, is_top and not has_tp)
             if show_tp:
-                tp_widget.pack(side="left", padx=s(3), before=eye)
+                tp_widget.pack(side="left", padx=Config.g(3), before=eye)
                 self.tp_shown[champ] = True
             else:
                 self.tp_shown[champ] = False
@@ -1100,7 +1286,7 @@ class OverlayApp:
             w.pack_forget()
             self.tp_shown[champ] = False
         else:
-            w.pack(side="left", padx=Config.s(3), before=eye)  # keep TP left of the eye toggle
+            w.pack(side="left", padx=Config.g(3), before=eye)  # keep TP left of the eye toggle
             self.tp_shown[champ] = True
         print(f"[TP] {champ}: {'shown' if self.tp_shown[champ] else 'hidden'}")
 
