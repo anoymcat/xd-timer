@@ -25,7 +25,9 @@
 - ✅ 补记：左键自动回溯 3s、Shift+左键回溯 20s、滚轮 ±5s。
 - ✅ 原生 TP 按游戏时间 + 等级算 CD；上单任务 TP 改 390s（26.19）。
 - ✅ 资源过期提示（`assets/version.txt` vs DDragon 最新版，托盘显示）。
-- ⏳ 未实测（需 Windows + 对局）：游戏前台自动禁用（`-disabled`）的实际表现、游戏窗口类名 / 标题识别、Alt-Tab 时能否选中本窗口、TP 等级插值是否与游戏内 tooltip 一致。
+- ✅ 游戏前台自动禁用实测通过（2026-10-21，Windows + 自定义对局）：窗口识别规则命中，游戏前台锁定、Alt-Tab 解锁均正常。
+- ⏳ 未实测：TP 等级插值是否与游戏内 tooltip 一致。
+- ⏳ 待改：`download_assets.py` 在游戏版本变化时会强制重下全部图标（`force_update`），版本小更新也全量下载。
 - ⏳ 未实测：真实"靴子 haste"套用（测试时 AI 未出明朗之靴；公式与逻辑已确认）。
 
 ## 3. 架构与关键实现
@@ -75,7 +77,7 @@
 - 已移除且**不再加回**：`overrideredirect(True)`、`wm_attributes("-alpha")`；以及 Win32 的 `WS_EX_NOACTIVATE`、`_apply_native_styles`。这三者 + 覆盖游戏才是反作弊盯的 overlay 特征组合。
 - **`-topmost` 已加回**（可开关，默认开，状态存 `config.json` 的 `topmost` 字段）：托盘菜单 "Always on Top" 勾选切换（`_toggle_topmost` / `_apply_topmost`），显示窗口时（`deiconify` 后）套用。置顶只改自身窗口 Z 序、不接触游戏进程。
 - **游戏前台自动禁用（`-disabled`，托盘 "Lock while game focused"，默认开，存 `lock_over_game`）**：放在主屏游戏之上时，非点击穿透的窗口被点到就会被激活、抢走游戏键盘焦点。故当游戏窗口在前台**且**本窗口与游戏在同一显示器时，用 Tk 自带 `wm_attributes("-disabled", True)` 禁用窗口：点击无响应、不抢焦点、不改计时（该区域的点击仍不会传给游戏）。Alt-Tab 出去（游戏不在前台）即恢复可点、可拖动。外线金边亮 = 可用，暗 = 禁用。
-  - 检测只**读**窗口信息（`_Win32`：`GetForegroundWindow` + `GetClassNameW` / `GetWindowTextW` + `MonitorFromWindow`），不打开游戏进程、不改任何窗口样式；用轮询而非系统事件回调。游戏窗口识别：类名 `RiotWindowClass` 或标题 `League of Legends (TM) Client` [需核实]。任何失败都返回"未锁定"（= 旧行为）。`DESKTIMER_DEBUG=1` 时控制台会打印每次前台窗口切换的类名 / 标题，用于核对识别规则。
+  - 检测只**读**窗口信息（`_Win32`：`GetForegroundWindow` + `GetClassNameW` / `GetWindowTextW` + `MonitorFromWindow`），不打开游戏进程、不改任何窗口样式；用轮询而非系统事件回调。游戏窗口识别：类名 `RiotWindowClass` 或标题 `League of Legends (TM) Client`（已实测命中）。任何失败都返回"未锁定"（= 旧行为）。`DESKTIMER_DEBUG=1` 时控制台会打印每次前台窗口切换的类名 / 标题，用于核对识别规则。
   - 窗口在副屏时不锁（不同显示器），保持直接点击的旧用法。
 - 仍**不加**：`overrideredirect`、`-alpha` / 色键透明、`WS_EX_NOACTIVATE`、点击穿透（`WS_EX_TRANSPARENT`）。半透明 + 置顶 + 点击穿透 + 覆盖游戏 = 外部透视外挂窗口的典型形态。
 - pystray 回调在托盘线程，切换置顶经 `root.after(0, ...)` 回到 UI 线程执行。**注意 pystray MenuItem 的 action/checked lambda 参数个数 ≤2**（含默认参数也计数，超了启动即 `ValueError`；用闭包捕获值，别加 `v=val` 默认参）。

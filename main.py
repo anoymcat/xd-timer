@@ -82,7 +82,7 @@ class Config:
     # While the game window is foreground AND this window sits on the same monitor,
     # the window is disabled (Tk "-disabled"): clicks do nothing and never steal focus.
     # Alt-tab out -> enabled again (click timers / drag). Window identified read-only
-    # via GetForegroundWindow + class name / title. [需核实: class name / title]
+    # via GetForegroundWindow + class name / title (verified on Windows 2026-10-21).
     GAME_WINDOW_CLASS = "RiotWindowClass"
     GAME_WINDOW_TITLE = "League of Legends (TM) Client"
     UI_TICK = 200  # ms: timer redraw + foreground check
