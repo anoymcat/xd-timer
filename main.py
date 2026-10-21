@@ -5,12 +5,15 @@ import json
 import signal
 import ctypes
 import threading
+import time
 import tkinter as tk
 from typing import Any, Dict, List, Optional, Tuple
 import requests
 import urllib3
 from PIL import Image, ImageTk, ImageDraw, ImageOps
 import pystray 
+from timer_core import (GameClock, TimerModel, apply_haste, rank_from_level as _rank_from_level,
+                        teleport_cd, fmt_countdown, fmt_clock)
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -61,9 +64,31 @@ class Config:
     COSMIC_HASTE = 18
 
     # 2026 Top-lane role quest reward: "Unleashed Teleport" granted as a bonus 3rd
-    # summoner spell (fixed 420s CD, level-independent) when the top laner did NOT
+    # summoner spell (fixed CD, level-independent) when the top laner did NOT
     # pick Teleport. If they already have TP, the quest only empowers it (no 3rd spell).
-    UNLEASHED_TP_CD = 420
+    # Patch 26.19: 420 -> 390. Native TP CD (level / game-time based) lives in timer_core.
+    UNLEASHED_TP_CD = 390
+
+    # === RETRO-RECORDING (game seconds) ===
+    # Recording always lags the real cast (alt-tab + click), so a plain left-click
+    # back-dates by REACTION_DELAY; Shift+left-click back-dates by LATE_OFFSET
+    # ("remembered after the fight"); mouse wheel on a running timer shifts it by
+    # WHEEL_STEP per notch. The first two can be overridden in config.json.
+    REACTION_DELAY = 3
+    LATE_OFFSET = 20
+    WHEEL_STEP = 5
+
+    # === IN-GAME LOCK ===
+    # While the game window is foreground AND this window sits on the same monitor,
+    # the window is disabled (Tk "-disabled"): clicks do nothing and never steal focus.
+    # Alt-tab out -> enabled again (click timers / drag). Window identified read-only
+    # via GetForegroundWindow + class name / title. [需核实: class name / title]
+    GAME_WINDOW_CLASS = "RiotWindowClass"
+    GAME_WINDOW_TITLE = "League of Legends (TM) Client"
+    UI_TICK = 200  # ms: timer redraw + foreground check
+
+    # Set by DDragonManager.update_timers(): (local, latest) when assets/ is stale.
+    ASSETS_OUTDATED: Optional[Tuple[str, str]] = None
 
     # === BASE SPELL TIMERS (Seconds) ===
     SPELL_TIMERS = {
@@ -143,6 +168,7 @@ class DDragonManager:
             v_resp = requests.get(Config.DDRAGON_VER_URL, timeout=2)
             if v_resp.status_code != 200: return
             version = v_resp.json()[0]
+            DDragonManager._check_assets_version(version)
 
             url = Config.DDRAGON_DATA_URL.format(version)
             d_resp = requests.get(url, timeout=3)
@@ -156,6 +182,20 @@ class DDragonManager:
                 Config.SPELL_TIMERS[key] = cd
         except Exception as e:
             print(f"[DDragon] Update failed: {e}")
+
+    @staticmethod
+    def _check_assets_version(latest: str):
+        """assets/version.txt is written by download_assets.py. If it differs from the
+        live DDragon version, flag it (shown in the tray); no auto-download."""
+        local = None
+        try:
+            with open(resource_path(os.path.join("assets", "version.txt"))) as f:
+                local = f.read().strip()
+        except OSError:
+            pass
+        if local != latest:
+            Config.ASSETS_OUTDATED = (local or "none", latest)
+            print(f"[Assets] Outdated: {local} -> {latest}. Run download_assets.py")
 
 # --- ABILITY (ULTIMATE) DATA ---
 class AbilityData:
@@ -386,7 +426,10 @@ class AssetManager:
 
 # --- SPELL TIMER WIDGET ---
 class SpellTimerWidget(tk.Canvas):
-    def __init__(self, parent, champ_name: str, spell_name: str, app_ref,
+    """One clickable icon. Holds NO timer state: the countdown lives in
+    app.timers (TimerModel, keyed by (champ, slot)) and is redrawn by app._ui_tick,
+    so rebuilding the window (scale change) keeps running timers."""
+    def __init__(self, parent, champ_name: str, spell_name: str, slot: str, app_ref,
                  base_cd: Optional[int] = None, icon_name: Optional[str] = None,
                  folder: str = "spells", r_cds: Optional[list] = None,
                  use_ability_haste: bool = False):
@@ -394,63 +437,71 @@ class SpellTimerWidget(tk.Canvas):
                          bg=Config.COLOR_BG, highlightthickness=0)
         self.champ_name = champ_name
         self.spell_name = spell_name
+        self.key = (champ_name, slot)    # TimerModel key; slot = S1 / S2 / R / UTP
         self.app_ref = app_ref # Reference to main app to access cache
-        self.base_cd_override = base_cd  # e.g. Unleashed TP = 420, bypasses SPELL_TIMERS
+        self.base_cd_override = base_cd  # e.g. Unleashed TP = 390, bypasses SPELL_TIMERS
         self.r_cds = r_cds               # ultimate: per-rank CDs; base picked by enemy level
         self.use_ability_haste = use_ability_haste  # R uses Ability Haste, not summoner haste
-        self.is_active = False
-        self.timer_job = None
+        self._text = None                # last drawn text (None = idle)
 
         self.icon_img = AssetManager.load_icon(folder, icon_name or spell_name, (Config.ICON_SIZE, Config.ICON_SIZE))
         self.create_image(0, 0, image=self.icon_img, anchor="nw")
         
         self.dim_img = AssetManager.create_dim_layer((Config.ICON_SIZE, Config.ICON_SIZE))
         self.dim_id = self.create_image(0, 0, image=self.dim_img, anchor="nw", state="hidden")
-        self.text_id = self.create_text(Config.ICON_SIZE//2, Config.ICON_SIZE//2, text="", state="hidden")
 
-        self.bind("<Button-1>", self._on_left_click)  
+        # Tk fires only the most specific binding, so Shift+click does NOT also fire <Button-1>.
+        self.bind("<Button-1>", lambda e: self._start(self.app_ref.reaction_delay))
+        self.bind("<Shift-Button-1>", lambda e: self._start(self.app_ref.late_offset))
         self.bind("<Button-3>", self._on_right_click) 
+        # Mouse wheel: handled globally by app._on_wheel (-> self.adjust).
 
-    def _on_left_click(self, event):
-        if self.is_active: return
+        app_ref.register_timer(self)
+        self.refresh()
 
-        # --- BASE CD ---
+    def _base_cd(self) -> Optional[float]:
         if self.r_cds:
             # Ultimate: rank estimated from the enemy's CURRENT level (cache, live).
             rank = self.app_ref.rank_from_level(self.champ_name)
             if rank <= 0:
-                return  # ult not unlocked yet (level < 6) -> ignore click
-            base_cd = self.r_cds[min(rank, len(self.r_cds)) - 1]
-        elif self.base_cd_override is not None:
-            base_cd = self.base_cd_override
-        else:
-            base_cd = Config.SPELL_TIMERS.get(self.spell_name.lower(), 300)
+                return None  # ult not unlocked yet (level < 6) -> ignore click
+            return self.r_cds[min(rank, len(self.r_cds)) - 1]
+        if self.base_cd_override is not None:
+            return self.base_cd_override
+        if self.spell_name == "SummonerTeleport":
+            return self.app_ref.teleport_base_cd(self.champ_name)
+        return Config.SPELL_TIMERS.get(self.spell_name.lower(), 300)
 
-        # --- CALCULATE COOLDOWN WITH HASTE ---
+    def _start(self, ago: float):
+        """Start the timer as if the spell was cast `ago` game-seconds earlier."""
+        timers = self.app_ref.timers
+        if timers.is_active(self.key): return
+        base_cd = self._base_cd()
+        if base_cd is None: return
+
         # R -> Ability Haste (items); summoner spells -> summoner-spell haste (+cosmic).
         if self.use_ability_haste:
             current_haste = self.app_ref.get_ability_haste(self.champ_name)
         else:
             current_haste = self.app_ref.get_haste(self.champ_name)
+        final_cd = apply_haste(base_cd, current_haste)
 
-        # Formula: ReducedCooldown = Base * (100 / (100 + Haste))
-        if current_haste > 0:
-            final_cd = base_cd * (100 / (100 + current_haste))
-            final_cd = int(final_cd)
-            print(f"[Timer] {self.champ_name} ({self.spell_name}): Base {base_cd}s -> Haste {current_haste} -> {final_cd}s")
-        else:
-            final_cd = base_cd
-
-        self._start_timer(final_cd)
+        now = self.app_ref.clock.now()
+        used_at = max(0.0, now - ago)
+        timers.start(self.key, final_cd, used_at)
+        print(f"[Timer] {self.champ_name} ({self.spell_name}): Base {base_cd:.0f}s -> Haste {current_haste} "
+              f"-> {final_cd:.1f}s, used {fmt_clock(used_at)}, ready {fmt_clock(used_at + final_cd)}")
+        self.refresh()
 
     def _on_right_click(self, event):
-        if self.is_active: self._reset()
+        self.app_ref.timers.reset(self.key)
+        self.refresh()
 
-    def _start_timer(self, duration):
-        self.is_active = True
-        self.itemconfig(self.dim_id, state="normal")
-        self.itemconfig(self.text_id, state="normal")
-        self._tick(duration)
+    def adjust(self, delta: float):
+        """Shift a running timer by delta seconds (mouse wheel)."""
+        if self.app_ref.timers.is_active(self.key):
+            self.app_ref.timers.adjust(self.key, delta)
+            self.refresh()
 
     def _get_adaptive_font(self, text: str) -> Tuple[str, int, str]:
         # Pixel-based size (negative => pixels in tk) tied to ICON_SIZE, so it tracks
@@ -469,20 +520,77 @@ class SpellTimerWidget(tk.Canvas):
             self.create_text(cx + ox, cy + oy, text=text, font=font_spec, fill=Config.COLOR_TEXT_OUTLINE, tags="timer_text", anchor="center")
         self.create_text(cx, cy, text=text, font=font_spec, fill=Config.COLOR_TEXT_ACTIVE, tags="timer_text", anchor="center")
 
-    def _tick(self, remaining):
-        if remaining <= 0:
-            self._reset()
+    def refresh(self):
+        """Redraw from the model. Display mode: 'ready' = game-clock time it comes
+        back (how players call it in chat, e.g. 14:25) / 'countdown' = seconds left."""
+        timers = self.app_ref.timers
+        remaining = timers.remaining(self.key, self.app_ref.clock.now())
+        if remaining is not None and remaining <= 0:
+            timers.reset(self.key)
+            remaining = None
+        if remaining is None:
+            if self._text is not None:
+                self.delete("timer_text")
+                self.itemconfig(self.dim_id, state="hidden")
+                self._text = None
             return
-        m, s = divmod(remaining, 60)
-        text = f"{m}:{s:02}" if remaining >= 60 else str(remaining)
-        self._draw_outlined_text(text)
-        self.timer_job = self.after(1000, lambda: self._tick(remaining - 1))
+        if self.app_ref.display_mode == "ready":
+            text = fmt_clock(timers.ready_at(self.key))
+        else:
+            text = fmt_countdown(remaining)
+        if text != self._text:
+            self.itemconfig(self.dim_id, state="normal")
+            self._draw_outlined_text(text)
+            self._text = text
 
-    def _reset(self):
-        self.is_active = False
-        if self.timer_job: self.after_cancel(self.timer_job)
-        self.delete("timer_text")
-        self.itemconfig(self.dim_id, state="hidden")
+# --- WIN32 (read-only window queries for the in-game lock) ---
+class _Win32:
+    """Only READS window info (foreground hwnd, class name, title, monitor).
+    Never opens the game process, never changes any window style."""
+    _user32 = None
+
+    @classmethod
+    def _api(cls):
+        if cls._user32 is None:
+            try:
+                u = ctypes.windll.user32
+            except AttributeError:
+                cls._user32 = False   # non-Windows
+                return None
+            u.GetForegroundWindow.restype = ctypes.c_void_p
+            u.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+            u.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+            u.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            u.MonitorFromWindow.restype = ctypes.c_void_p
+            cls._user32 = u
+        return cls._user32 or None
+
+    @classmethod
+    def _is_game(cls, u, hwnd) -> bool:
+        buf = ctypes.create_unicode_buffer(256)
+        u.GetClassNameW(hwnd, buf, 256)
+        if buf.value == Config.GAME_WINDOW_CLASS:
+            return True
+        u.GetWindowTextW(hwnd, buf, 256)
+        return buf.value == Config.GAME_WINDOW_TITLE
+
+    @classmethod
+    def game_foreground_on_same_monitor(cls, root: tk.Tk) -> bool:
+        """True if the game window is foreground and on the same monitor as `root`.
+        Any failure -> False (window stays usable, i.e. old behaviour)."""
+        u = cls._api()
+        if u is None:
+            return False
+        try:
+            fg = u.GetForegroundWindow()
+            if not fg or not cls._is_game(u, fg):
+                return False
+            mine = int(root.wm_frame(), 16)
+            MONITOR_DEFAULTTONEAREST = 2
+            return u.MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) == \
+                   u.MonitorFromWindow(mine, MONITOR_DEFAULTTONEAREST)
+        except Exception:
+            return False
 
 # --- MAIN APP ---
 class OverlayApp:
@@ -490,15 +598,23 @@ class OverlayApp:
         self.root = tk.Tk()
         self.root.title("DeskTimer")
         self.root.configure(bg=Config.COLOR_BG)
-        # Normal desktop window: still NO overrideredirect / alpha / WS_EX_NOACTIVATE.
-        # Only "-topmost" is allowed (user-toggleable, default on), so it stays above
-        # other secondary-screen windows without becoming an overlay: it keeps its
-        # border, taskbar entry, is opaque, and never covers the game (secondary screen).
+        # Normal desktop window: still NO overrideredirect / alpha / WS_EX_NOACTIVATE /
+        # click-through. Allowed: "-topmost" (user-toggleable, default on) and Tk's
+        # "-disabled" (in-game lock, see Config.GAME_WINDOW_CLASS). The window keeps its
+        # border, taskbar entry and is opaque; it may sit over the game on the main
+        # screen, but is disabled while the game is foreground so it never takes focus.
         # Do NOT re-add the other overlay attributes — that combo is what anti-cheat flags.
 
         self.game_active = False
         self.enemy_data_cache = {} # Cache to store fresh enemy data
         self._img_refs = []
+
+        # Timer state lives here (not in widgets) so rebuilds keep running timers.
+        self.clock = GameClock()
+        self.timers = TimerModel()
+        self._timer_widgets: List[SpellTimerWidget] = []
+        self._debug_t0 = None     # DEBUG_DUMMY: fake game clock origin
+        self._locked = False      # in-game lock (Tk -disabled) currently applied
 
         # Per-enemy manual modifiers (reset each game):
         self.cosmic_toggle = {}   # champ -> bool: apply +18 haste (Cosmic Insight)
@@ -514,6 +630,10 @@ class OverlayApp:
         self.is_pinned = False
         self.is_topmost = True  # overwritten by _load_config
         self.scale = 1.0        # overwritten by _load_config
+        self.display_mode = "ready"   # 'ready' (game-clock time) | 'countdown'
+        self.lock_over_game = True
+        self.reaction_delay = Config.REACTION_DELAY
+        self.late_offset = Config.LATE_OFFSET
         self._load_config()
         Config.apply_scale(self.scale)
 
@@ -527,8 +647,12 @@ class OverlayApp:
         self._setup_tray()
         
         signal.signal(signal.SIGINT, self._graceful_exit)
+
+        # Wheel goes to the widget under the pointer regardless of Tk version/focus.
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
         
         self._monitor_game_loop()
+        self._ui_tick()
 
     def _build_shell(self):
         """Build (or rebuild) the window chrome: Hextech gold double-line border +
@@ -540,7 +664,8 @@ class OverlayApp:
         # Nested frames form the border: each frame's bg is a "line" colour, and its
         # child packed with padx/pady reveals that colour as a ring of that thickness.
         # gold line -> dark moat -> gold line -> content.
-        self.container = tk.Frame(self.root, bg=Config.COLOR_GOLD)          # outer gold line
+        # outer gold line (dimmed while the in-game lock is on, see _update_lock_visual)
+        self.container = tk.Frame(self.root, bg=Config.COLOR_GOLD_DIM if self._locked else Config.COLOR_GOLD)
         self.container.pack()
         moat = tk.Frame(self.container, bg=Config.COLOR_MOAT)               # dark moat
         moat.pack(padx=s(1), pady=s(1))
@@ -575,7 +700,8 @@ class OverlayApp:
     def _rebuild_all(self):
         self._build_shell()
         if self.game_active and self.enemy_data_cache:
-            self._build_enemy_rows(list(self.enemy_data_cache.values()))
+            # Keep this game's timers / cosmic / TP toggles (state is not in the widgets).
+            self._build_enemy_rows(list(self.enemy_data_cache.values()), reset_state=False)
         self.root.geometry(f"+{self.saved_x}+{self.saved_y}")
         self._apply_topmost()
 
@@ -598,11 +724,64 @@ class OverlayApp:
         """Estimate ultimate rank from the enemy's current level (R at 6/11/16).
         Players almost always level R on cooldown, so this is a good heuristic.
         Returns 0 if the ult isn't unlocked yet (< level 6)."""
-        lvl = self.enemy_data_cache.get(champ_name, {}).get('level', 1) or 1
-        if lvl >= 16: return 3
-        if lvl >= 11: return 2
-        if lvl >= 6:  return 1
-        return 0
+        return _rank_from_level(self.enemy_data_cache.get(champ_name, {}).get('level', 1))
+
+    def teleport_base_cd(self, champ_name: str) -> float:
+        """Native TP base CD: 360s before 10:00, then Unleashed (level-scaled;
+        top laner uses the role-quest range). See timer_core.teleport_cd."""
+        data = self.enemy_data_cache.get(champ_name, {})
+        return teleport_cd(self.clock.now(), data.get('level', 1), data.get('position') == 'TOP')
+
+    def register_timer(self, widget: "SpellTimerWidget"):
+        self._timer_widgets.append(widget)
+
+    def _refresh_timers(self):
+        for w in self._timer_widgets:
+            w.refresh()
+
+    def _ui_tick(self):
+        """Single UI loop: redraw timers from the model + apply the in-game lock."""
+        if self.game_active:
+            self._refresh_timers()
+            self._update_lock()
+        self.root.after(Config.UI_TICK, self._ui_tick)
+
+    def _on_wheel(self, event):
+        w = self.root.winfo_containing(event.x_root, event.y_root)
+        if isinstance(w, SpellTimerWidget) and event.delta:
+            notches = max(1, abs(event.delta) // 120)
+            sign = 1 if event.delta > 0 else -1   # up = ready later, down = earlier
+            w.adjust(sign * notches * Config.WHEEL_STEP)
+
+    # --- In-game lock ---
+    def _update_lock(self):
+        self._set_locked(self.lock_over_game and _Win32.game_foreground_on_same_monitor(self.root))
+
+    def _set_locked(self, locked: bool):
+        if locked == self._locked: return
+        self._locked = locked
+        try:
+            self.root.wm_attributes("-disabled", locked)
+        except tk.TclError:
+            pass  # non-Windows
+        self._update_lock_visual()
+
+    def _update_lock_visual(self):
+        if self.container is not None:
+            self.container.config(bg=Config.COLOR_GOLD_DIM if self._locked else Config.COLOR_GOLD)
+
+    def _toggle_lock(self, icon=None, item=None):
+        self.lock_over_game = not self.lock_over_game
+        self._save_config()
+        if not self.lock_over_game:
+            self.root.after(0, lambda: self._set_locked(False))
+        print(f"[Lock] {'ON' if self.lock_over_game else 'OFF'}")
+
+    def _set_display_mode(self, mode: str):
+        self.display_mode = mode
+        self._save_config()
+        self.root.after(0, self._refresh_timers)
+        print(f"[Display] {mode}")
 
     def _setup_tray(self):
         def quit_app(icon, item):
@@ -637,15 +816,39 @@ class OverlayApp:
             )
         scale_menu = pystray.Menu(*[make_scale_item(p) for p in (50, 75, 100, 125, 150, 175, 200)])
 
-        menu = pystray.Menu(
+        def make_display_item(label, mode):
+            return pystray.MenuItem(
+                label,
+                lambda icon, item: self._set_display_mode(mode),
+                checked=lambda item: self.display_mode == mode,
+                radio=True,
+            )
+        display_menu = pystray.Menu(
+            make_display_item("Ready time (14:25)", "ready"),
+            make_display_item("Countdown", "countdown"),
+        )
+
+        items = [
             pystray.MenuItem(
                 "Always on Top",
                 self._toggle_topmost,
                 checked=lambda item: self.is_topmost,
             ),
+            pystray.MenuItem(
+                "Lock while game focused",
+                self._toggle_lock,
+                checked=lambda item: self.lock_over_game,
+            ),
+            pystray.MenuItem("Display", display_menu),
             pystray.MenuItem("Scale", scale_menu),
             pystray.MenuItem("Quit", quit_app),
-        )
+        ]
+        if Config.ASSETS_OUTDATED:
+            local, latest = Config.ASSETS_OUTDATED
+            items.insert(0, pystray.MenuItem(
+                f"Assets outdated: {local} -> {latest} (run download_assets.py)",
+                lambda icon, item: None, enabled=False))
+        menu = pystray.Menu(*items)
         self.tray_icon = pystray.Icon("DeskTimer", image, "DeskTimer", menu)
         
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
@@ -660,6 +863,11 @@ class OverlayApp:
                     self.is_pinned = data.get('pinned', False)
                     self.is_topmost = data.get('topmost', True)
                     self.scale = float(data.get('scale', 1.0))
+                    if data.get('display_mode') in ("ready", "countdown"):
+                        self.display_mode = data['display_mode']
+                    self.lock_over_game = data.get('lock_over_game', True)
+                    self.reaction_delay = float(data.get('reaction_delay', Config.REACTION_DELAY))
+                    self.late_offset = float(data.get('late_offset', Config.LATE_OFFSET))
                     print(f"[Config] Loaded: Pos({self.saved_x},{self.saved_y}), Pinned({self.is_pinned}), Topmost({self.is_topmost}), Scale({self.scale})")
             except Exception as e:
                 print(f"[Config] Load error: {e}")
@@ -674,7 +882,11 @@ class OverlayApp:
             'y': self.saved_y,
             'pinned': self.is_pinned,
             'topmost': self.is_topmost,
-            'scale': self.scale
+            'scale': self.scale,
+            'display_mode': self.display_mode,
+            'lock_over_game': self.lock_over_game,
+            'reaction_delay': self.reaction_delay,
+            'late_offset': self.late_offset,
         }
         try:
             with open(Config.CONFIG_FILE, 'w') as f:
@@ -720,9 +932,15 @@ class OverlayApp:
         data = GameDataManager.fetch_data()
         if data:
             enemies = GameDataManager.parse_enemies(data)
+            game_time = (data.get("gameData") or {}).get("gameTime")
+            if game_time is not None:
+                self.clock.sync(game_time)
         elif Config.DEBUG_DUMMY:
-            # Offline UI testing: no live game, show dummy enemies.
+            # Offline UI testing: no live game, show dummy enemies; fake clock from 10:00.
             enemies = GameDataManager._get_dummy_data()
+            if self._debug_t0 is None:
+                self._debug_t0 = time.monotonic()
+            self.clock.sync(600 + time.monotonic() - self._debug_t0)
         else:
             enemies = None
 
@@ -746,12 +964,15 @@ class OverlayApp:
         else:
             if self.game_active:
                 print("[DeskTimer] Data lost, hiding window.")
+                self._set_locked(False)
                 self.root.withdraw()
                 self._save_config()
                 self.game_active = False
                 self.enemy_data_cache.clear()
                 self.cosmic_toggle.clear()
                 self.tp_shown.clear()
+                self.timers.clear()
+                self.clock.reset()
 
         self.root.after(Config.CHECK_INTERVAL, self._monitor_game_loop)
 
@@ -760,11 +981,16 @@ class OverlayApp:
             self._cosmic_on, self._cosmic_off = AssetManager.load_toggle_pair(
                 "runes", "CosmicInsight", (Config.EYE_SIZE, Config.EYE_SIZE))
 
-    def _build_enemy_rows(self, enemies: List[Dict]):
-        # Full rebuild (only on game start) -> reset per-enemy modifier state.
+    def _build_enemy_rows(self, enemies: List[Dict], reset_state: bool = True):
+        # reset_state=True on game start (new game -> fresh timers / modifiers);
+        # False on a scale rebuild (keep this game's timers / cosmic / TP toggles).
+        self._timer_widgets.clear()
         for widget in self.enemies_frame.winfo_children(): widget.destroy()
         self._img_refs.clear()
-        self.cosmic_toggle.clear()
+        prev_tp_shown = {} if reset_state else dict(self.tp_shown)
+        if reset_state:
+            self.timers.clear()
+            self.cosmic_toggle.clear()
         self.tp_shown.clear()
         self._tp_widgets.clear()
         self._eye_widgets.clear()
@@ -794,16 +1020,16 @@ class OverlayApp:
             r_info = AbilityData.r_info(champ)
             if r_info and r_info.get('cd'):
                 r_icon = os.path.splitext(r_info['icon'])[0]  # e.g. "SeraphineR"
-                rw = SpellTimerWidget(row, champ, "R", self, icon_name=r_icon,
+                rw = SpellTimerWidget(row, champ, "R", "R", self, icon_name=r_icon,
                                       folder="abilities", r_cds=r_info['cd'],
                                       use_ability_haste=True)
                 rw.pack(side="left", padx=(0, s(6)))
                 self._img_refs.append(rw.icon_img)
                 self._img_refs.append(rw.dim_img)
 
-            for s_name in [enemy['spell1'], enemy['spell2']]:
+            for slot, s_name in (("S1", enemy['spell1']), ("S2", enemy['spell2'])):
                 # Pass 'self' (app) reference so the button can query cache
-                sw = SpellTimerWidget(row, champ, s_name, self)
+                sw = SpellTimerWidget(row, champ, s_name, slot, self)
                 sw.pack(side="left", padx=s(3))
                 self._img_refs.append(sw.icon_img)
                 self._img_refs.append(sw.dim_img)
@@ -812,20 +1038,23 @@ class OverlayApp:
             #     packed only when applicable; toggle preserves running timers. ---
             has_tp = "SummonerTeleport" in (enemy['spell1'], enemy['spell2'])
             is_top = enemy.get('position') == 'TOP'
-            tp_widget = SpellTimerWidget(row, champ, "SummonerTeleport", self,
+            tp_widget = SpellTimerWidget(row, champ, "SummonerTeleport", "UTP", self,
                                          base_cd=Config.UNLEASHED_TP_CD, icon_name="SummonerTeleport")
             self._tp_widgets[champ] = tp_widget
             self._img_refs.append(tp_widget.icon_img)
             self._img_refs.append(tp_widget.dim_img)
 
             # --- Cosmic Insight toggle (far right, small). Off by default. ---
-            eye = tk.Label(row, image=self._cosmic_off, bg=Config.COLOR_BG, bd=0, cursor="hand2")
+            eye_img = self._cosmic_on if self.cosmic_toggle.get(champ) else self._cosmic_off
+            eye = tk.Label(row, image=eye_img, bg=Config.COLOR_BG, bd=0, cursor="hand2")
             eye.pack(side="left", padx=(s(8), 0))
             eye.bind("<Button-1>", lambda e, c=champ: self._toggle_cosmic(c))
             self._eye_widgets[champ] = eye
 
-            # Auto-show Unleashed TP for the top laner who did NOT pick TP.
-            if is_top and not has_tp:
+            # Auto-show Unleashed TP for the top laner who did NOT pick TP
+            # (on a rebuild, keep whatever the user had toggled).
+            show_tp = prev_tp_shown.get(champ, is_top and not has_tp)
+            if show_tp:
                 tp_widget.pack(side="left", padx=s(3), before=eye)
                 self.tp_shown[champ] = True
             else:
