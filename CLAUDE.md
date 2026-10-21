@@ -19,7 +19,7 @@
 - ✅ 置顶可开关（默认开，托盘切换，存 config）。
 - ✅ 星界洞悉手动开关（每敌 +18，眼睛图标切换）+ 上单附赠 Unleashed Teleport 自动/手动按钮（26.19 起 390s）。
 - ✅ DPI 感知 + 托盘比例缩放（50–200%）+ 海克斯金双线边框。
-- ✅ 大招（R）计时：R 图标 + 按等级估基础 CD + 自动吃装备 Ability Haste（见 §3 大招 R CD）。
+- ✅ 大招（R）计时：R 图标 + 按等级估基础 CD + 自动吃装备 Ability Haste（见 §3 大招 R CD）。托盘 "Ultimate (R) Timer" 可开关，存 `show_r`（默认开，切换走 `_rebuild_all`，R 计时保留在 `TimerModel`）。从未合并的 `feat/calibration-and-r-toggle` 分支移植；该分支的 `−20s` 按钮已被 Shift+左键 / 滚轮补记取代，没有移植。
 - ✅ 计时状态模型（`timer_core.py`）：按游戏时间（`gameData.gameTime`）计时；改缩放不再丢计时 / 星界 / TP 开关。单元测试 `tests/`。
 - ✅ 显示方式：报点时间（就绪时刻，如 14:25，默认）/ 倒计时，托盘切换。
 - ✅ 补记：左键自动回溯 3s、Shift+左键回溯 20s、滚轮 ±5s。
@@ -80,7 +80,7 @@
 - 已移除且**不再加回**：`overrideredirect(True)`；以及 Win32 的 `WS_EX_NOACTIVATE`、`_apply_native_styles`。
 - **`-alpha` 已加回（2026-10-21，用户在三个方案中明确选了 B）**：托盘 Opacity 100/90/80/70/60%，默认 80%，存 `config.json` 的 `alpha`。只做半透明，**不**点击穿透：看得见下面的地面，但点击到不了游戏。代价：置顶 + 半透明 + 覆盖游戏比不透明窗口更接近 overlay 特征，被反作弊注意的风险高于原方案，用户已知悉。被否决的方案 C（`-alpha` + `WS_EX_TRANSPARENT` 点击穿透）与外部透视外挂窗口形态一致，**不做**。
 - **标题栏配色（`_Dwm.style_title_bar`）**：对自身 `wm_frame()` hwnd 调 `DwmSetWindowAttribute`：深色模式（20，旧版 19）、标题栏色 35 = `COLOR_BG`、边框色 34 = `COLOR_GOLD`、标题文字色 36（34–36 需 Win11 22000+）。只改自己窗口，失败静默降级。每次显示窗口时（`_apply_window_attrs`）套用。
-- **紧凑布局（托盘 "Compact layout"，默认开，存 `compact`）**：`Config.LAYOUTS` 两套基础尺寸——普通 38px 图标 / 22px 眼睛 / 有分隔线 / 有拖动把手；紧凑 26px / 16px / 无分隔线 / 无把手 / 间距 ×0.5（`Config.g`）。再乘托盘缩放比例。紧凑模式用原生标题栏拖动；pin 移到托盘 "Pin position"（普通模式右键把手也可切换），pin 住时标题栏拖动后 300ms 弹回原位（`_on_configure`；不子类化窗口过程，所以挡不住拖动本身）。位置由 `<Configure>` 记录。窗口 `resizable(False, False)`。
+- **紧凑布局（托盘 "Compact layout"，默认开，存 `compact`）**：`Config.LAYOUTS` 两套基础尺寸——普通 38px 图标 / 22px 眼睛 / 有分隔线；紧凑 26px / 16px / 无分隔线 / 间距 ×0.5（`Config.g`）。再乘托盘缩放比例。两种布局都保留拖动把手（左键拖动、右键 pin，副屏上用得着），标题栏也能拖；pin 也可在托盘 "Pin position" 切换，pin 住时标题栏拖动后 300ms 弹回原位（`_on_configure`；不子类化窗口过程，所以挡不住拖动本身）。位置由 `<Configure>` 记录。窗口 `resizable(False, False)`。
 - **`-topmost` 已加回**（可开关，默认开，状态存 `config.json` 的 `topmost` 字段）：托盘菜单 "Always on Top" 勾选切换（`_toggle_topmost` / `_apply_topmost`），显示窗口时（`deiconify` 后）套用。置顶只改自身窗口 Z 序、不接触游戏进程。
 - **游戏前台自动禁用（`-disabled`，托盘 "Lock while game focused"，默认开，存 `lock_over_game`）**：放在主屏游戏之上时，非点击穿透的窗口被点到就会被激活、抢走游戏键盘焦点。故当游戏窗口在前台**且**本窗口与游戏在同一显示器时，用 Tk 自带 `wm_attributes("-disabled", True)` 禁用窗口：点击无响应、不抢焦点、不改计时（该区域的点击仍不会传给游戏）。Alt-Tab 出去（游戏不在前台）即恢复可点、可拖动。外线金边亮 = 可用，暗 = 禁用。
   - 检测只**读**窗口信息（`_Win32`：`GetForegroundWindow` + `GetClassNameW` / `GetWindowTextW` + `MonitorFromWindow`），不打开游戏进程、不改任何窗口样式；用轮询而非系统事件回调。游戏窗口识别：类名 `RiotWindowClass` 或标题 `League of Legends (TM) Client`（已实测命中）。任何失败都返回"未锁定"（= 旧行为）。`DESKTIMER_DEBUG=1` 时控制台会打印每次前台窗口切换的类名 / 标题，用于核对识别规则。

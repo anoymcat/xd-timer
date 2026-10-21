@@ -754,6 +754,7 @@ class OverlayApp:
         self.lock_over_game = True
         self.alpha = Config.DEFAULT_ALPHA
         self.compact = True
+        self.show_r = True      # build ultimate (R) timers? (tray toggle)
         self.reaction_delay = Config.REACTION_DELAY
         self.late_offset = Config.LATE_OFFSET
         self._load_config()
@@ -803,16 +804,15 @@ class OverlayApp:
         content = tk.Frame(self.inner, bg=Config.COLOR_BG)
         content.pack(padx=Config.g(6), pady=Config.g(5))
 
-        # Drag handle only in the normal layout; compact moves by the native title bar
-        # (pin then lives in the tray, see _on_configure).
-        self.handle = None
-        if not Config.COMPACT:
-            self.handle = tk.Label(content, text="::::", bg=Config.COLOR_BG, fg=Config.COLOR_HANDLE,
-                                   font=(Config.FONT_FAMILY, -max(7, s(9)), "bold"), cursor="fleur")
-            self.handle.pack(fill="x", pady=(0, s(3)))
-            self.handle.bind("<ButtonPress-1>", self._start_drag)
-            self.handle.bind("<B1-Motion>", self._do_drag)
-            self.handle.bind("<Button-3>", self._toggle_pin)
+        # Drag handle (left-drag = move, right-click = pin) in both layouts; the title
+        # bar also moves the window (pinned -> snaps back, see _on_configure).
+        self.handle = tk.Label(content, text="::::", bg=Config.COLOR_BG, fg=Config.COLOR_HANDLE,
+                               font=(Config.FONT_FAMILY, -max(7, s(8 if Config.COMPACT else 9)), "bold"),
+                               cursor="fleur")
+        self.handle.pack(fill="x", pady=(0, Config.g(3)))
+        self.handle.bind("<ButtonPress-1>", self._start_drag)
+        self.handle.bind("<B1-Motion>", self._do_drag)
+        self.handle.bind("<Button-3>", self._toggle_pin)
         self._update_pin_visual()
 
         self.enemies_frame = tk.Frame(content, bg=Config.COLOR_BG)
@@ -835,6 +835,15 @@ class OverlayApp:
         self._save_config()
         self.root.after(0, self._rebuild_all)
         print(f"[Layout] {'compact' if compact else 'normal'}")
+
+    def _toggle_show_r(self, icon=None, item=None):
+        # Show/hide ultimate (R) timers. Widgets are added/removed -> rebuild (like
+        # Scale); running R timers stay in TimerModel and reappear when shown again.
+        # Called from the pystray thread -> marshal the rebuild onto the UI thread.
+        self.show_r = not self.show_r
+        self._save_config()
+        self.root.after(0, self._rebuild_all)
+        print(f"[ShowR] {'ON' if self.show_r else 'OFF'}")
 
     def _rebuild_all(self):
         self._build_shell()
@@ -1010,6 +1019,11 @@ class OverlayApp:
                 checked=lambda item: self.is_topmost,
             ),
             pystray.MenuItem(
+                "Ultimate (R) Timer",
+                self._toggle_show_r,
+                checked=lambda item: self.show_r,
+            ),
+            pystray.MenuItem(
                 "Compact layout",
                 lambda icon, item: self._set_compact(not self.compact),
                 checked=lambda item: self.compact,
@@ -1054,6 +1068,7 @@ class OverlayApp:
                     self.lock_over_game = data.get('lock_over_game', True)
                     self.alpha = min(1.0, max(0.2, float(data.get('alpha', Config.DEFAULT_ALPHA))))
                     self.compact = bool(data.get('compact', True))
+                    self.show_r = bool(data.get('show_r', True))
                     self.reaction_delay = float(data.get('reaction_delay', Config.REACTION_DELAY))
                     self.late_offset = float(data.get('late_offset', Config.LATE_OFFSET))
                     print(f"[Config] Loaded: Pos({self.saved_x},{self.saved_y}), Pinned({self.is_pinned}), Topmost({self.is_topmost}), Scale({self.scale})")
@@ -1075,6 +1090,7 @@ class OverlayApp:
             'lock_over_game': self.lock_over_game,
             'alpha': self.alpha,
             'compact': self.compact,
+            'show_r': self.show_r,
             'reaction_delay': self.reaction_delay,
             'late_offset': self.late_offset,
         }
@@ -1230,7 +1246,7 @@ class OverlayApp:
             lbl.bind("<Button-3>", lambda e, c=champ: self._toggle_tp(c))
 
             # --- Ultimate (R): icon from DDragon, CD by rank(level), Ability Haste from items ---
-            r_info = AbilityData.r_info(champ)
+            r_info = AbilityData.r_info(champ) if self.show_r else None
             if r_info and r_info.get('cd'):
                 r_icon = os.path.splitext(r_info['icon'])[0]  # e.g. "SeraphineR"
                 rw = SpellTimerWidget(row, champ, "R", "R", self, icon_name=r_icon,
