@@ -185,6 +185,10 @@ class Config:
     DDRAGON_DATA_URL = "https://ddragon.leagueoflegends.com/cdn/{}/data/en_US/summoner.json"
     
     CHECK_INTERVAL = 2000 # Check every 2 seconds
+    # A single slow / failed poll (busy real match) must not end the game: hiding and
+    # re-showing the window clears this game's timers, and deiconify activates the
+    # window, stealing focus from the game. Only hide after this many misses in a row.
+    MISS_LIMIT = 3
 
     # Debug switch: when env DESKTIMER_DEBUG=1, show dummy enemies even with no
     # live game running, so the window layout can be tested offline.
@@ -733,6 +737,7 @@ class OverlayApp:
         self.timers = TimerModel()
         self._timer_widgets: List[SpellTimerWidget] = []
         self._debug_t0 = None     # DEBUG_DUMMY: fake game clock origin
+        self._miss_count = 0      # consecutive failed polls while a game is shown
         self._locked = False      # in-game lock (Tk -disabled) currently applied
         self._last_fg = None      # DEBUG_DUMMY: last logged foreground hwnd
 
@@ -1173,6 +1178,7 @@ class OverlayApp:
             enemies = None
 
         if enemies is not None:
+            self._miss_count = 0
             # 1. Update cache with fresh data (items/haste)
             for enemy in enemies:
                 self.enemy_data_cache[enemy['champ']] = enemy
@@ -1190,8 +1196,12 @@ class OverlayApp:
             # NOTE: We do NOT rebuild UI in loop to preserve running timers.
             # Haste data is fetched from cache dynamically on click.
 
-        else:
-            if self.game_active:
+        elif self.game_active:
+            self._miss_count += 1
+            if self._miss_count < Config.MISS_LIMIT:
+                print(f"[DeskTimer] Poll missed ({self._miss_count}/{Config.MISS_LIMIT}), keeping window.")
+            else:
+                self._miss_count = 0
                 print("[DeskTimer] Data lost, hiding window.")
                 self._set_locked(False)
                 self.root.withdraw()
