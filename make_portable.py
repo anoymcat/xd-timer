@@ -5,7 +5,7 @@
   1. 从 python-build-standalone 下载 Windows x64 的 install_only 完整发行版
      （含 tkinter；官方 embeddable 版不含 tkinter，不能用）。
   2. 解压到 <out>/python/，用它 pip 安装 requirements.txt 的依赖。
-  3. 拷入 main.py / download_assets.py / make_icon.py / assets/ / ico/ 等。
+  3. 拷入 main.py / timer_core.py / download_assets.py / make_icon.py / assets/ / ico/ 等。
   4. 生成 DeskTimer.vbs（无黑窗启动）+ DeskTimer.bat + 创建桌面快捷方式.vbs。
   5. 打包成 DeskTimer_portable.zip。
 
@@ -31,7 +31,7 @@ PYDIR = os.path.join(APPDIR, "python")
 ZIP_OUT = os.path.join(ROOT, "DeskTimer_portable.zip")
 
 # 打包进便携版的源码/资源（存在才拷）
-INCLUDE_FILES = ["main.py", "download_assets.py", "make_icon.py",
+INCLUDE_FILES = ["main.py", "timer_core.py", "download_assets.py", "make_icon.py",
                  "requirements.txt", "README.md"]
 INCLUDE_DIRS = ["assets", "ico"]
 

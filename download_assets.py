@@ -1,10 +1,13 @@
 """
 Smart Asset Downloader for LoL Tracker.
 Checks for LoL updates via DDragon.
-- If version changed: Redownloads ALL assets to ensure latest art.
-- If version same: Downloads only MISSING assets.
+- Images: downloads only MISSING files (new champions / renamed R icons), on any version.
+- Data (abilities/r_index.json, abilities/item_ah.json): regenerated on every run,
+  so per-patch CD / ability-haste changes are always picked up.
+- --force: redownload ALL images (e.g. after a splash/icon rework).
 """
 
+import argparse
 import os
 import json
 import requests
@@ -160,6 +163,11 @@ def sync_abilities(version, force):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Sync DeskTimer assets from DDragon.")
+    parser.add_argument("--force", action="store_true",
+                        help="redownload all images, not just missing ones")
+    args = parser.parse_args()
+
     # 1. Setup Directories
     os.makedirs(CHAMP_DIR, exist_ok=True)
     os.makedirs(SPELL_DIR, exist_ok=True)
@@ -175,15 +183,18 @@ def main():
 
     local_ver = get_local_version()
     
-    force_update = False
-    
+    # Patches rarely change existing art, so a version bump no longer forces a full
+    # redownload; missing images are fetched and the JSON data is rebuilt every run.
+    force_update = args.force
+
     if local_ver != latest_ver:
         print(f" [!] Update detected! Local: {local_ver} -> Latest: {latest_ver}")
-        print(" [i] Doing a full sync...")
-        force_update = True
     else:
         print(f" [OK] Version {latest_ver} is up to date.")
-        print(" [i] Checking for missing files only...")
+    if force_update:
+        print(" [i] --force: redownloading all images...")
+    else:
+        print(" [i] Downloading missing images only (use --force for a full redownload)...")
 
     # 3. Download Champions
     print("\n--- Syncing Champions ---")
