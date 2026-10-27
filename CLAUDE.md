@@ -16,18 +16,19 @@
 - ✅ localhost 2999 代理绕过、命名中性化、离线调试开关、桌面快捷方式 + 自定义图标。
 - ✅ 已提交私有仓库 `anoymcat/xd-timer`。
 - ✅ 头像加载修复：`rawChampionName` 存在两种格式，改用 `_resolve_champ_name` 解析（见 §3）。
-- ✅ 置顶可开关（默认开，托盘切换，存 config）。
+- ✅ 置顶可开关（默认开，设置窗口切换，存 config）。
 - ✅ 星界洞悉手动开关（每敌 +18，眼睛图标切换）+ 上单附赠 Unleashed Teleport 自动/手动按钮（26.19 起 390s）。
-- ✅ DPI 感知 + 托盘比例缩放（50–200%）+ 海克斯金双线边框。
-- ✅ 大招（R）计时：R 图标 + 按等级估基础 CD + 自动吃装备 Ability Haste（见 §3 大招 R CD）。托盘 "Ultimate (R) Timer" 可开关，存 `show_r`（默认开，切换走 `_rebuild_all`，R 计时保留在 `TimerModel`）。从未合并的 `feat/calibration-and-r-toggle` 分支移植；该分支的 `−20s` 按钮已被 Shift+左键 / 滚轮补记取代，没有移植。
+- ✅ DPI 感知 + 比例缩放（设置窗口 75–200%，乘 Windows 显示缩放）+ 海克斯金双线边框。
+- ✅ 大招（R）计时：R 图标 + 按等级估基础 CD + 自动吃装备 Ability Haste（见 §3 大招 R CD）。设置（大招计时）可开关，存 `show_r`（默认开，切换走 `_rebuild_all`，R 计时保留在 `TimerModel`）。从未合并的 `feat/calibration-and-r-toggle` 分支移植；该分支的 `−20s` 按钮已被 Shift+左键 / 滚轮补记取代，没有移植。
 - ✅ 计时状态模型（`timer_core.py`）：按游戏时间（`gameData.gameTime`）计时；改缩放不再丢计时 / 星界 / TP 开关。单元测试 `tests/`。
-- ✅ 显示方式：报点时间（就绪时刻，如 14:25，默认）/ 倒计时，托盘切换。
+- ✅ 显示方式：报点时间（就绪时刻，如 14:25，默认）/ 倒计时，设置窗口切换。
 - ✅ 补记：左键自动回溯 3s、Shift+左键回溯 20s、滚轮 ±5s。
 - ✅ 原生 TP 按游戏时间 + 等级算 CD；上单任务 TP 改 390s（26.19）。
-- ✅ 资源过期提示（`assets/version.txt` vs DDragon 最新版，托盘显示）。
+- ✅ 资源过期提示（`assets/version.txt` vs DDragon 最新版，设置窗口顶部和托盘菜单显示）。
 - ✅ 游戏前台自动禁用实测通过（2026-10-21，Windows + 自定义对局）：窗口识别规则命中，游戏前台锁定、Alt-Tab 解锁均正常。
-- ✅ 主屏外观（2026-10-21，用户选方案 B）：`-alpha` 半透明（托盘 Opacity，默认 80%，**不**点击穿透）+ DWM 深蓝标题栏 / 金色边框 + 紧凑布局（托盘 Compact layout，默认开）+ 冷却扇形遮罩。调试模式截图确认，**待进游戏实测**。
+- ✅ 主屏外观（2026-10-21，用户选方案 B）：`-alpha` 半透明（设置（不透明度），默认 80%，**不**点击穿透）+ DWM 深蓝标题栏 / 金色边框 + 紧凑布局（固定开启）+ 冷却扇形遮罩。调试模式截图确认，**待进游戏实测**。
 - ✅ `download_assets.py`：图片只补缺失，JSON 每次重建，`--force` 全量重下。
+- ✅ 待机窗口 + 设置窗口（2026-10-27，用户在本机目视确认）：启动即显示 5 行占位框，对局结束回到待机、不再隐藏；窗口右上角 ⚙ / 单击托盘打开中文设置窗口（6 项），托盘只剩（设置）（退出）；从窗口退出需 3 秒内二次点击；界面大小乘 Windows 显示缩放（`Config.DPI_SCALE`）。**待进游戏实测**。
 - ⚠️ 正式对局中锁定未生效（点窗口会计时、QWER 失灵；2026-10-21 用户反馈）。自定义对局实测是正常的。疑似原因（未证实）：正式对局中轮询偶发失败 → 旧逻辑立即判定对局结束、隐藏窗口，下一次成功又 `deiconify` 重新显示；`deiconify` 会激活本窗口、抢走游戏焦点（前台不再是游戏 → 解锁），同时清空计时。2026-10-22 已改为连续 `MISS_LIMIT=3` 次失败才判定结束。待正式对局复测；若仍复现，看 `DESKTIMER_DEBUG=1` 下有无 `Poll missed` / `Data found` 反复出现，以及 `[Lock]` 日志。
 - ⏳ 未实测：TP 等级插值是否与游戏内 tooltip 一致。
 - ⏳ 未实测：真实"靴子 haste"套用（测试时 AI 未出明朗之靴；公式与逻辑已确认）。
@@ -35,7 +36,7 @@
 ## 3. 架构与关键实现
 
 ### 数据源
-- `https://127.0.0.1:2999/liveclientdata/allgamedata`，`verify=False`，每 2s 轮询（`GameDataManager`），超时 0.5s（轮询在 UI 线程）。连续 `MISS_LIMIT=3` 次失败才判定对局结束并隐藏窗口；单次失败不动窗口，避免清空计时和 `deiconify` 抢焦点。
+- `https://127.0.0.1:2999/liveclientdata/allgamedata`，`verify=False`，每 2s 轮询（`GameDataManager`），超时 0.5s（轮询在 UI 线程）。连续 `MISS_LIMIT=3` 次失败才判定对局结束、回到待机占位（见 §3 窗口）；单次失败不动窗口，避免清空计时。
 - **游戏时间**：`gameData.gameTime`（秒）每次轮询喂给 `GameClock.sync`；两次轮询之间按本地单调时钟插值，最多外推 3s（游戏暂停时不会一直往前跑）。所有计时以它为准。
 - **localhost 必须绕过系统代理**：`fetch_data` 传 `proxies={"http": None, "https": None}`。若机器走 VPN/代理，127.0.0.1 会被劫持导致连接失败。DDragon（外网）请求**保持**走系统代理。
 - 敌我判断：用 `activePlayer.summonerName` 在 `allPlayers` 中匹配队伍（含 Riot tagline，如 `内向腼腆#74139`），排除同队即敌方。
@@ -58,7 +59,7 @@
 ### 计时状态与显示（`timer_core.py`）
 - `TimerModel`：`(英雄, 槽位)` → 就绪时刻（游戏秒）+ 总 CD，槽位 = `S1` / `S2` / `R` / `UTP`。控件不存状态，`OverlayApp._ui_tick`（每 200ms）统一按模型重绘，所以重建窗口不丢计时。
 - **冷却遮罩**：图标上的暗色扇形随剩余比例（`TimerModel.fraction`）从 12 点方向顺时针收缩，同游戏内；两种显示模式都有（报点模式的数字本身不动，靠遮罩看出在走）。`sweep_step` 分 60 档，`AssetManager.sweep_layer` 按 (尺寸, 档) 缓存 PIL 生成的 RGBA 图。补记 / 滚轮只移就绪时刻，总 CD 不变（推迟超过总 CD 时遮罩封顶为满）。
-- 显示方式（`config.json` 的 `display_mode`，托盘 Display 切换）：`ready` = 就绪时刻（游戏时钟 mm:ss，向上取整，符合聊天报点习惯），`countdown` = 剩余秒数。
+- 显示方式（`config.json` 的 `display_mode`，设置窗口切换）：`ready` = 就绪时刻（游戏时钟 mm:ss，向上取整，符合聊天报点习惯），`countdown` = 剩余秒数。
 - 补记（录入总比实际施放晚）：左键 = 现在 − `reaction_delay`（默认 3s）；Shift+左键 = 现在 − `late_offset`（默认 20s，打完团才想起来）；运行中的计时器上滚轮每格 ±5s（上 = 推迟，下 = 提前）；右键重置。前两个值可在 `config.json` 改。滚轮用 `bind_all` + `winfo_containing` 分发到指针下的控件。
 - `timer_core.py` 不依赖 tkinter / Win32，测试：`python -m unittest discover -s tests`。
 
@@ -77,22 +78,28 @@
 
 ### 窗口
 - 普通 tkinter 窗口：有标题栏、进任务栏、**半透明**（见下）。可放副屏，也可拖到主屏游戏之上（游戏需无边框模式）。
+- **待机窗口（2026-10-27）**：启动即显示，不再 `withdraw` / 每局 `deiconify`（`deiconify` 会激活窗口、抢游戏焦点）。无对局时 `_build_standby_rows` 画 `STANDBY_ROWS=5` 行占位框，槽位与真实行同尺寸同间距（共用 `_new_row`），上面 `place` 一行（等待对局开始）；对局开始换成真实行，结束（`MISS_LIMIT`）回到占位。游戏前台锁定在待机时也运行（加载界面已是游戏窗口但 API 还没数据）。
+- **设置窗口（`SettingsWindow`，2026-10-27）**：拖动条右侧 ⚙ 或单击托盘打开（无边框全屏下托盘难进）。`Toplevel` + `transient(root)`，有标题栏、DWM 配色同主窗口，主窗口置顶时它也置顶；改动立即生效并存 config。6 项：显示方式、大招计时、界面大小（75–200%）、不透明度、窗口置顶、固定位置；外加操作说明和（退出 DeskTimer）按钮。字体用点数（Tk 按 DPI 缩放），间距只乘 `DPI_SCALE`、不随界面大小。游戏前台锁定时主窗口不可点，⚙ 需 Alt-Tab 切出后点。
+  - 已从设置中移除、固定开启：紧凑布局（`compact`）、游戏前台自动禁用（`lock_over_game`）；`config.json` 里手动改仍有效。
+  - 托盘菜单只剩（设置）（默认项，单击托盘即触发）和（退出），资源过期时多一行提示。
+  - 退出：托盘（退出）直接退；主窗口 ✕（`_request_quit`，拖动条提示）和设置里的退出按钮需 `QUIT_CONFIRM_MS=3000` 内二次点击，用二次点击而非弹窗，避免弹窗抢游戏焦点。
 - 已移除且**不再加回**：`overrideredirect(True)`；以及 Win32 的 `WS_EX_NOACTIVATE`、`_apply_native_styles`。
-- **`-alpha` 已加回（2026-10-21，用户在三个方案中明确选了 B）**：托盘 Opacity 100/90/80/70/60%，默认 80%，存 `config.json` 的 `alpha`。只做半透明，**不**点击穿透：看得见下面的地面，但点击到不了游戏。代价：置顶 + 半透明 + 覆盖游戏比不透明窗口更接近 overlay 特征，被反作弊注意的风险高于原方案，用户已知悉。被否决的方案 C（`-alpha` + `WS_EX_TRANSPARENT` 点击穿透）与外部透视外挂窗口形态一致，**不做**。
+- **`-alpha` 已加回（2026-10-21，用户在三个方案中明确选了 B）**：设置项（不透明度）100/90/80/70/60%，默认 80%，存 `config.json` 的 `alpha`。只做半透明，**不**点击穿透：看得见下面的地面，但点击到不了游戏。代价：置顶 + 半透明 + 覆盖游戏比不透明窗口更接近 overlay 特征，被反作弊注意的风险高于原方案，用户已知悉。被否决的方案 C（`-alpha` + `WS_EX_TRANSPARENT` 点击穿透）与外部透视外挂窗口形态一致，**不做**。
 - **标题栏配色（`_Dwm.style_title_bar`）**：对自身 `wm_frame()` hwnd 调 `DwmSetWindowAttribute`：深色模式（20，旧版 19）、标题栏色 35 = `COLOR_BG`、边框色 34 = `COLOR_GOLD`、标题文字色 36（34–36 需 Win11 22000+）。只改自己窗口，失败静默降级。每次显示窗口时（`_apply_window_attrs`）套用。
-- **紧凑布局（托盘 "Compact layout"，默认开，存 `compact`）**：`Config.LAYOUTS` 两套基础尺寸——普通 38px 图标 / 22px 眼睛 / 有分隔线；紧凑 26px / 16px / 无分隔线 / 间距 ×0.5（`Config.g`）。再乘托盘缩放比例。两种布局都保留拖动把手（左键拖动、右键 pin，副屏上用得着），标题栏也能拖；pin 也可在托盘 "Pin position" 切换，pin 住时标题栏拖动后 300ms 弹回原位（`_on_configure`；不子类化窗口过程，所以挡不住拖动本身）。位置由 `<Configure>` 记录。窗口 `resizable(False, False)`。
-- **`-topmost` 已加回**（可开关，默认开，状态存 `config.json` 的 `topmost` 字段）：托盘菜单 "Always on Top" 勾选切换（`_toggle_topmost` / `_apply_topmost`），显示窗口时（`deiconify` 后）套用。置顶只改自身窗口 Z 序、不接触游戏进程。
-- **游戏前台自动禁用（`-disabled`，托盘 "Lock while game focused"，默认开，存 `lock_over_game`）**：放在主屏游戏之上时，非点击穿透的窗口被点到就会被激活、抢走游戏键盘焦点。故当游戏窗口在前台**且**本窗口与游戏在同一显示器时，用 Tk 自带 `wm_attributes("-disabled", True)` 禁用窗口：点击无响应、不抢焦点、不改计时（该区域的点击仍不会传给游戏）。Alt-Tab 出去（游戏不在前台）即恢复可点、可拖动。外线金边亮 = 可用，暗 = 禁用。
+- **紧凑布局（默认开，存 `compact`，2026-10-27 起不在设置中）**：`Config.LAYOUTS` 两套基础尺寸——普通 38px 图标 / 22px 眼睛 / 有分隔线；紧凑 26px / 16px / 无分隔线 / 间距 ×0.5（`Config.g`）。再乘界面大小和 DPI 缩放。两种布局都保留拖动把手（左键拖动、右键 pin，副屏上用得着），标题栏也能拖；pin 也可在设置（固定位置）切换，pin 住时标题栏拖动后 300ms 弹回原位（`_on_configure`；不子类化窗口过程，所以挡不住拖动本身）。位置由 `<Configure>` 记录。窗口 `resizable(False, False)`。
+- **`-topmost` 已加回**（可开关，默认开，状态存 `config.json` 的 `topmost` 字段）：设置（窗口置顶）切换（`_set_topmost` / `_apply_topmost`），启动和重建窗口时套用。置顶只改自身窗口 Z 序、不接触游戏进程。
+- **游戏前台自动禁用（`-disabled`，默认开，存 `lock_over_game`，2026-10-27 起不在设置中）**：放在主屏游戏之上时，非点击穿透的窗口被点到就会被激活、抢走游戏键盘焦点。故当游戏窗口在前台**且**本窗口与游戏在同一显示器时，用 Tk 自带 `wm_attributes("-disabled", True)` 禁用窗口：点击无响应、不抢焦点、不改计时（该区域的点击仍不会传给游戏）。Alt-Tab 出去（游戏不在前台）即恢复可点、可拖动。外线金边亮 = 可用，暗 = 禁用。
   - 检测只**读**窗口信息（`_Win32`：`GetForegroundWindow` + `GetClassNameW` / `GetWindowTextW` + `MonitorFromWindow`），不打开游戏进程、不改任何窗口样式；用轮询而非系统事件回调。游戏窗口识别：类名 `RiotWindowClass` 或标题 `League of Legends (TM) Client`（已实测命中）。任何失败都返回"未锁定"（= 旧行为）。`DESKTIMER_DEBUG=1` 时控制台会打印每次前台窗口切换的类名 / 标题，用于核对识别规则。
   - 窗口在副屏时不锁（不同显示器），保持直接点击的旧用法。
 - 仍**不加**：`overrideredirect`、色键透明（`-transparentcolor`）、`WS_EX_NOACTIVATE`、`WS_EX_TOOLWINDOW`、点击穿透（`WS_EX_TRANSPARENT`）。半透明 + 置顶 + 点击穿透 + 覆盖游戏 = 外部透视外挂窗口的典型形态；现在已有前三项，点击穿透是最后一道线。
-- pystray 回调在托盘线程，切换置顶经 `root.after(0, ...)` 回到 UI 线程执行。**注意 pystray MenuItem 的 action/checked lambda 参数个数 ≤2**（含默认参数也计数，超了启动即 `ValueError`；用闭包捕获值，别加 `v=val` 默认参）。
-- 保留：自定义拖动把手、pin、`config.json` 记忆位置、系统托盘退出、单实例 mutex。
+- pystray 回调在托盘线程，打开设置 / 退出经 `root.after(0, ...)` 回到 UI 线程执行。**注意 pystray MenuItem 的 action/checked lambda 参数个数 ≤2**（含默认参数也计数，超了启动即 `ValueError`；用闭包捕获值，别加 `v=val` 默认参）。
+- 保留：自定义拖动把手、pin、`config.json` 记忆位置、系统托盘、单实例 mutex。
 - `DEBUG_DUMMY`（环境变量 `DESKTIMER_DEBUG=1`）：无对局时也显示 dummy 敌方，便于离线调试窗口形态。
 
 ### 清晰度 / 缩放 / 边框
 - **DPI 感知**：`_enable_dpi_awareness()` 在 `Tk()` **之前**调 `SetProcessDpiAwarenessContext(-4)`（Per-Monitor v2，带旧系统兜底）→ 原生像素渲染，避免 HiDPI 位图拉伸发虚。圆头像遮罩 4× 超采样抗锯齿；计时字体用像素制（负值）。
-- **比例缩放**：托盘 `Scale` 子菜单 50/75/100/125/150/175/200%，存 `config.json` 的 `scale`。尺寸从当前布局（普通 / 紧凑，`Config.apply_layout`）的 `BASE_ICON_SIZE`/`BASE_EYE_SIZE` × scale + `Config.s(v)` / `Config.g(v)` 派生；切换 `_set_scale` / `_set_compact`→`_rebuild_all`（重建窗口；计时在 `TimerModel`、星界 / TP 开关在 app 上，`reset_state=False` 时均保留）。
+- **DPI 缩放（2026-10-27）**：`_system_dpi_scale()` 启动时读一次 `GetDpiForSystem()/96` 存 `Config.DPI_SCALE`，所有尺寸再乘它，高分屏上界面大小 100% 即标准大小。窗口拖到缩放不同的另一块屏不会重算（已知局限）。旧 config（无 `scale_dpi` 字段）的 `scale` 按 `scale / DPI_SCALE` 换算到最近一档（`nearest_scale_choice`），之后保存时写 `scale_dpi: true`。
+- **比例缩放**：设置（界面大小）75/100/125/150/175/200%（`SCALE_CHOICES`），存 `config.json` 的 `scale`。尺寸从当前布局（普通 / 紧凑，`Config.apply_layout`）的 `BASE_ICON_SIZE`/`BASE_EYE_SIZE` × scale × `DPI_SCALE`（`Config.s(v)` / `Config.g(v)`）派生；切换 `_set_scale`→`_rebuild_all`（重建窗口；计时在 `TimerModel`、星界 / TP 开关在 app 上，`reset_state=False` 时均保留）。
 - **海克斯金双线边框**：`_build_shell()` 用嵌套帧（父帧 bg 当"线"色，子帧 pack padx 露出）：金亮外线→深色护城河→暗金内线→深蓝面板。配色 `COLOR_GOLD`/`COLOR_GOLD_DIM`/`COLOR_MOAT`。真圆角/去标题栏需透明窗口那套 = overlay 特征，故不做，走矩形。
 
 ### 触发
@@ -111,7 +118,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `main.py` | 主程序（数据轮询 + UI + 托盘 + 游戏前台禁用） |
+| `main.py` | 主程序（数据轮询 + UI + 设置窗口 + 托盘 + 游戏前台禁用） |
 | `timer_core.py` | 计时核心：游戏时钟、计时状态模型、CD / 急速 / TP / 格式化函数（无 UI 依赖） |
 | `tests/` | `timer_core` 单元测试（`python -m unittest discover -s tests`） |
 | `download_assets.py` | 从 DDragon 下载英雄/技能/大招图标到 `assets/`（只补缺失，`--force` 全量），并每次重建 `abilities/r_index.json`、`abilities/item_ah.json`（Meraki） |
@@ -126,6 +133,7 @@
 
 - Windows + Anaconda Python（本机在 `E:\Anaconda3`，注意系统 `python` 是 Microsoft Store 占位符，不可用）。
 - venv 由 Anaconda python 创建：`E:\Anaconda3\python.exe -m venv venv`。
+- 出行笔记本（2026-10-22 部署）：项目在 `D:\xd-timer`，venv 由 `D:\Python\Python314\python.exe`（3.14，Tk 9.0）创建；主屏 2560×1600、Windows 显示缩放 150%。
 - 桌面快捷方式 `DeskTimer.lnk` → `venv\Scripts\pythonw.exe main.py`，工作目录为项目根。
 
 ## 7. 精度局限（已接受）
