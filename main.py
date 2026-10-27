@@ -86,6 +86,9 @@ class Config:
     GAME_WINDOW_CLASS = "RiotWindowClass"
     GAME_WINDOW_TITLE = "League of Legends (TM) Client"
     UI_TICK = 200  # ms: timer redraw + foreground check
+    # Quitting from the window (close button / settings) needs a second click within
+    # this time, so a stray click doesn't end the app mid-game. Tray "退出" is direct.
+    QUIT_CONFIRM_MS = 3000
 
     # Set by DDragonManager.update_timers(): (local, latest) when assets/ is stale.
     ASSETS_OUTDATED: Optional[Tuple[str, str]] = None
@@ -126,14 +129,19 @@ class Config:
     GAP = 1.0
 
     # --- Scaling ---
-    # BASE_* are the 100% design sizes (px) of the current layout. Effective sizes are
-    # recomputed by apply_scale(). DPI awareness (see _enable_dpi_awareness) keeps them crisp.
+    # BASE_* are the 100% design sizes (px) of the current layout at 96 DPI. Effective
+    # sizes = BASE * SCALE (user, settings "界面大小") * DPI_SCALE (Windows display
+    # scaling, read once at startup by _system_dpi_scale), recomputed by apply_scale().
+    # DPI awareness (see _enable_dpi_awareness) keeps them crisp.
     BASE_ICON_SIZE = 38
     BASE_EYE_SIZE = 22      # Cosmic Insight toggle icon (smaller than spell icons)
     SCALE = 1.0
-    ICON_SIZE = 38          # = round(BASE_ICON_SIZE * SCALE)
-    EYE_SIZE = 22           # = round(BASE_EYE_SIZE  * SCALE)
+    DPI_SCALE = 1.0
+    ICON_SIZE = 38          # = round(BASE_ICON_SIZE * SCALE * DPI_SCALE)
+    EYE_SIZE = 22           # = round(BASE_EYE_SIZE  * SCALE * DPI_SCALE)
     ROW_PADDING_Y = 6
+    SCALE_CHOICES = (75, 100, 125, 150, 175, 200)  # percent
+    STANDBY_ROWS = 5        # placeholder rows shown before a game starts
 
     COLOR_BG = "#091428"
     COLOR_SEPARATOR = "#0A1F33"
@@ -149,7 +157,11 @@ class Config:
     COLOR_PINNED = "#8B0000"    # Dark Red
     COLOR_HANDLE = "#785A28"    # soft gold
 
+    COLOR_PLACEHOLDER = "#2E4560"   # standby skeleton outlines
+    COLOR_TEXT_DIM = "#A09B8C"      # secondary text (standby status, hints)
+
     FONT_FAMILY = "Arial"
+    UI_FONT = "Microsoft YaHei UI"  # Chinese UI text (standby, settings window)
     BASE_FONT_SIZE = 12
 
     @classmethod
@@ -166,13 +178,13 @@ class Config:
     @classmethod
     def apply_scale(cls, scale: float):
         cls.SCALE = scale
-        cls.ICON_SIZE = max(1, round(cls.BASE_ICON_SIZE * scale))
-        cls.EYE_SIZE = max(1, round(cls.BASE_EYE_SIZE * scale))
+        cls.ICON_SIZE = cls.s(cls.BASE_ICON_SIZE)
+        cls.EYE_SIZE = cls.s(cls.BASE_EYE_SIZE)
 
     @classmethod
     def s(cls, v) -> int:
-        """Scale a base pixel/padding value by the current SCALE (min 1)."""
-        return max(1, round(v * cls.SCALE))
+        """Scale a base pixel/padding value by SCALE x DPI_SCALE (min 1)."""
+        return max(1, round(v * cls.SCALE * cls.DPI_SCALE))
 
     @classmethod
     def g(cls, v) -> int:
@@ -193,6 +205,14 @@ class Config:
     # Debug switch: when env DESKTIMER_DEBUG=1, show dummy enemies even with no
     # live game running, so the window layout can be tested offline.
     DEBUG_DUMMY = os.environ.get("DESKTIMER_DEBUG", "") == "1"
+
+def nearest_scale_choice(scale: float) -> float:
+    """Closest entry of Config.SCALE_CHOICES (as a factor, e.g. 1.25)."""
+    return min(Config.SCALE_CHOICES, key=lambda p: abs(p / 100 - scale)) / 100
+
+def assets_outdated_text() -> str:
+    local, latest = Config.ASSETS_OUTDATED
+    return f"图标资源已过期（{local} → {latest}），请运行 download_assets.py"
 
 # --- DDRAGON MANAGER ---
 class DDragonManager:
@@ -692,10 +712,11 @@ class _Dwm:
         return (b << 16) | (g << 8) | r     # COLORREF = 0x00BBGGRR
 
     @classmethod
-    def style_title_bar(cls, root: tk.Tk):
+    def style_title_bar(cls, win: tk.Wm):
+        """`win` = the main window or the settings window (any of our own toplevels)."""
         try:
             dwm = ctypes.windll.dwmapi
-            hwnd = ctypes.c_void_p(int(root.wm_frame(), 16))
+            hwnd = ctypes.c_void_p(int(win.wm_frame(), 16))
         except (AttributeError, OSError, ValueError, tk.TclError):
             return
 
@@ -711,6 +732,164 @@ class _Dwm:
         set_attr(cls.DWMWA_CAPTION_COLOR, cls._colorref(Config.COLOR_BG))
         set_attr(cls.DWMWA_BORDER_COLOR, cls._colorref(Config.COLOR_GOLD))
         set_attr(cls.DWMWA_TEXT_COLOR, cls._colorref(Config.COLOR_TEXT_ACTIVE))
+
+# --- SETTINGS WINDOW ---
+class SettingsWindow(tk.Toplevel):
+    """Settings dialog, opened from the gear on the main window or the tray (the tray
+    is hard to reach in borderless fullscreen). A normal titled window owned by the
+    main window; every change applies and saves immediately. Fonts are in points
+    (Tk scales them by DPI); paddings follow Config.DPI_SCALE only, not the UI scale."""
+
+    def __init__(self, app: "OverlayApp"):
+        super().__init__(app.root, bg=Config.COLOR_BG)
+        self.app = app
+        self.title("DeskTimer 设置")
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self.var_display = tk.StringVar(self, app.display_mode)
+        self.var_r = tk.IntVar(self)
+        self.var_scale = tk.IntVar(self)
+        self.var_alpha = tk.IntVar(self)
+        self.var_top = tk.IntVar(self)
+        self.var_pin = tk.IntVar(self)
+        self.sync()
+
+        p = self._px
+        body = tk.Frame(self, bg=Config.COLOR_BG)
+        body.pack(padx=p(16), pady=p(12))
+        self._row = 0
+        if Config.ASSETS_OUTDATED:
+            self._text(body, assets_outdated_text(), Config.COLOR_GOLD)
+
+        on_off = [("开", 1), ("关", 0)]
+        self._section(body, "计时")
+        self._choice(body, "显示方式", self.var_display,
+                     [("报点时间（如 14:25）", "ready"), ("倒计时", "countdown")],
+                     lambda: app._set_display_mode(self.var_display.get()))
+        self._choice(body, "大招计时", self.var_r, on_off,
+                     lambda: app._set_show_r(bool(self.var_r.get())))
+        self._section(body, "窗口")
+        self._choice(body, "界面大小", self.var_scale,
+                     [(f"{v}%", v) for v in Config.SCALE_CHOICES],
+                     lambda: app._set_scale(self.var_scale.get() / 100))
+        self._choice(body, "不透明度", self.var_alpha,
+                     [(f"{v}%", v) for v in sorted(Config.ALPHA_CHOICES)],
+                     lambda: app._set_alpha(self.var_alpha.get() / 100))
+        self._choice(body, "窗口置顶", self.var_top, on_off,
+                     lambda: app._set_topmost(bool(self.var_top.get())))
+        self._choice(body, "固定位置", self.var_pin, on_off,
+                     lambda: app._set_pinned(bool(self.var_pin.get())))
+
+        self._section(body, "操作")
+        self._text(body,
+                   f"左键：开始计时（按 {app.reaction_delay:g} 秒前）　Shift+左键：按 {app.late_offset:g} 秒前\n"
+                   f"滚轮：计时中每格 ±{Config.WHEEL_STEP} 秒　右键：清除计时\n"
+                   "眼睛图标：星界洞悉 +18 急速　右键头像：增减上单传送\n"
+                   "游戏在前台时主窗口不可点击，Alt-Tab 切出后操作",
+                   Config.COLOR_TEXT_DIM)
+
+        self._quit_job = None
+        self._quit_btn = tk.Button(body, text="退出 DeskTimer", command=self._on_quit_click,
+                                   font=(Config.UI_FONT, 9),
+                                   bg=Config.COLOR_MOAT, fg=Config.COLOR_TEXT_ACTIVE,
+                                   activebackground=Config.COLOR_GOLD_DIM,
+                                   activeforeground=Config.COLOR_TEXT_ACTIVE,
+                                   relief="flat", bd=0, padx=p(14), pady=p(4), cursor="hand2")
+        self._quit_btn.grid(row=self._row, column=0, columnspan=2, sticky="e", pady=(p(12), 0))
+
+        self._place_beside_main()
+        self.apply_topmost()
+        self.update_idletasks()
+        _Dwm.style_title_bar(self)
+        self.show()
+
+    @staticmethod
+    def _px(v) -> int:
+        return max(1, round(v * Config.DPI_SCALE))
+
+    def _section(self, parent, title: str):
+        tk.Label(parent, text=title, bg=Config.COLOR_BG, fg=Config.COLOR_GOLD,
+                 font=(Config.UI_FONT, 10, "bold")
+                 ).grid(row=self._row, column=0, columnspan=2, sticky="w",
+                        pady=(self._px(10) if self._row else 0, self._px(4)))
+        self._row += 1
+
+    def _text(self, parent, text: str, fg: str):
+        tk.Label(parent, text=text, bg=Config.COLOR_BG, fg=fg, justify="left",
+                 font=(Config.UI_FONT, 9)
+                 ).grid(row=self._row, column=0, columnspan=2, sticky="w")
+        self._row += 1
+
+    def _choice(self, parent, label: str, var: tk.Variable, options, command):
+        """One setting = label + a row of segmented buttons (radio buttons)."""
+        p = self._px
+        tk.Label(parent, text=label, bg=Config.COLOR_BG, fg=Config.COLOR_TEXT_ACTIVE,
+                 font=(Config.UI_FONT, 9)
+                 ).grid(row=self._row, column=0, sticky="w", padx=(0, p(14)), pady=p(3))
+        seg = tk.Frame(parent, bg=Config.COLOR_BG)
+        seg.grid(row=self._row, column=1, sticky="w", pady=p(3))
+        for text, value in options:
+            tk.Radiobutton(seg, text=text, variable=var, value=value, command=command,
+                           indicatoron=False, font=(Config.UI_FONT, 9),
+                           bg=Config.COLOR_MOAT, fg=Config.COLOR_TEXT_ACTIVE,
+                           selectcolor=Config.COLOR_GOLD_DIM,
+                           activebackground=Config.COLOR_SEPARATOR,
+                           activeforeground=Config.COLOR_TEXT_ACTIVE,
+                           relief="flat", offrelief="flat", bd=0, highlightthickness=0,
+                           padx=p(8), pady=p(2), cursor="hand2"
+                           ).pack(side="left", padx=(0, p(2)))
+        self._row += 1
+
+    def sync(self):
+        """Pull current values from the app (e.g. pin toggled on the drag handle)."""
+        a = self.app
+        self.var_display.set(a.display_mode)
+        self.var_r.set(int(a.show_r))
+        self.var_scale.set(round(a.scale * 100))
+        self.var_alpha.set(round(a.alpha * 100))
+        self.var_top.set(int(a.is_topmost))
+        self.var_pin.set(int(a.is_pinned))
+
+    def _on_quit_click(self):
+        """First click arms (button turns red), a second within QUIT_CONFIRM_MS quits."""
+        if self._quit_job is not None:
+            self.app._quit()
+            return
+        self._quit_btn.config(text="再点一次确认退出", bg=Config.COLOR_PINNED)
+        self._quit_job = self.after(Config.QUIT_CONFIRM_MS, self._disarm_quit)
+
+    def _disarm_quit(self):
+        self._quit_job = None
+        self._quit_btn.config(text="退出 DeskTimer", bg=Config.COLOR_MOAT)
+
+    def _place_beside_main(self):
+        """Left of the main window if it fits on screen, else to its right."""
+        self.update_idletasks()
+        root, gap = self.app.root, self._px(12)
+        x = root.winfo_x() - self.winfo_reqwidth() - gap
+        if x < 0:
+            x = root.winfo_x() + root.winfo_width() + gap
+        self.geometry(f"+{x}+{root.winfo_y()}")
+
+    def apply_topmost(self):
+        # Owned by the main window; if that is topmost this must be too, or it opens
+        # behind it.
+        try:
+            self.wm_attributes("-topmost", bool(self.app.is_topmost))
+        except tk.TclError:
+            pass
+
+    def show(self):
+        self.sync()
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _close(self):
+        self.app._on_settings_closed()
+        self.destroy()
 
 # --- MAIN APP ---
 class OverlayApp:
@@ -772,12 +951,22 @@ class OverlayApp:
         self.root.bind("<Configure>", self._on_configure)
 
         self.container = None
+        self.handle = None
+        self._settings: Optional["SettingsWindow"] = None
         self._build_shell()
 
-        self.root.withdraw()
-        
+        # Shown from startup (standby placeholder until a game starts) so it's visible
+        # that the app is running; never withdrawn / re-shown per game. The close
+        # button quits the app (after a confirming second click, _request_quit).
+        self._quit_job = None
+        self._build_standby_rows()
+        self.root.geometry(f"+{self.saved_x}+{self.saved_y}")
+        self.root.update_idletasks()   # wrapper hwnd exists before DWM styling
+        self._apply_window_attrs()
+        self.root.protocol("WM_DELETE_WINDOW", self._request_quit)
+
         self._setup_tray()
-        
+
         signal.signal(signal.SIGINT, self._graceful_exit)
 
         # Wheel goes to the widget under the pointer regardless of Tk version/focus.
@@ -809,12 +998,19 @@ class OverlayApp:
         content = tk.Frame(self.inner, bg=Config.COLOR_BG)
         content.pack(padx=Config.g(6), pady=Config.g(5))
 
-        # Drag handle (left-drag = move, right-click = pin) in both layouts; the title
-        # bar also moves the window (pinned -> snaps back, see _on_configure).
-        self.handle = tk.Label(content, text="::::", bg=Config.COLOR_BG, fg=Config.COLOR_HANDLE,
-                               font=(Config.FONT_FAMILY, -max(7, s(8 if Config.COMPACT else 9)), "bold"),
+        # Top bar: drag handle (left-drag = move, right-click = pin) + settings gear.
+        # The title bar also moves the window (pinned -> snaps back, see _on_configure).
+        bar = tk.Frame(content, bg=Config.COLOR_BG)
+        bar.pack(fill="x", pady=(0, Config.g(3)))
+        gear = tk.Label(bar, text="⚙", bg=Config.COLOR_BG, fg=Config.COLOR_HANDLE,
+                        font=(Config.UI_FONT, -max(9, s(12 if Config.COMPACT else 14))),
+                        cursor="hand2")
+        gear.pack(side="right")
+        gear.bind("<Button-1>", lambda e: self.open_settings())
+        self.handle = tk.Label(bar, text="::::", bg=Config.COLOR_BG, fg=Config.COLOR_HANDLE,
+                               font=(Config.UI_FONT, -max(7, s(8 if Config.COMPACT else 9)), "bold"),
                                cursor="fleur")
-        self.handle.pack(fill="x", pady=(0, Config.g(3)))
+        self.handle.pack(side="left", fill="x", expand=True)
         self.handle.bind("<ButtonPress-1>", self._start_drag)
         self.handle.bind("<B1-Motion>", self._do_drag)
         self.handle.bind("<Button-3>", self._toggle_pin)
@@ -824,7 +1020,7 @@ class OverlayApp:
         self.enemies_frame.pack()
 
     def _set_scale(self, scale: float):
-        """Tray callback: change UI scale, persist, and rebuild on the UI thread."""
+        """Settings: change UI scale, persist, and rebuild."""
         self.scale = scale
         Config.apply_scale(scale)
         self._cosmic_on = self._cosmic_off = None  # force re-render at the new size
@@ -832,20 +1028,10 @@ class OverlayApp:
         self.root.after(0, self._rebuild_all)
         print(f"[Scale] {int(scale*100)}%")
 
-    def _set_compact(self, compact: bool):
-        """Tray callback: switch normal / compact layout and rebuild on the UI thread."""
-        self.compact = compact
-        Config.apply_layout(compact)
-        self._cosmic_on = self._cosmic_off = None  # force re-render at the new size
-        self._save_config()
-        self.root.after(0, self._rebuild_all)
-        print(f"[Layout] {'compact' if compact else 'normal'}")
-
-    def _toggle_show_r(self, icon=None, item=None):
+    def _set_show_r(self, on: bool):
         # Show/hide ultimate (R) timers. Widgets are added/removed -> rebuild (like
         # Scale); running R timers stay in TimerModel and reappear when shown again.
-        # Called from the pystray thread -> marshal the rebuild onto the UI thread.
-        self.show_r = not self.show_r
+        self.show_r = on
         self._save_config()
         self.root.after(0, self._rebuild_all)
         print(f"[ShowR] {'ON' if self.show_r else 'OFF'}")
@@ -855,6 +1041,8 @@ class OverlayApp:
         if self.game_active and self.enemy_data_cache:
             # Keep this game's timers / cosmic / TP toggles (state is not in the widgets).
             self._build_enemy_rows(list(self.enemy_data_cache.values()), reset_state=False)
+        else:
+            self._build_standby_rows()
         self.root.geometry(f"+{self.saved_x}+{self.saved_y}")
         self._apply_window_attrs()
 
@@ -871,7 +1059,6 @@ class OverlayApp:
             print(f"[Opacity] apply failed: {e}")
 
     def _set_alpha(self, alpha: float):
-        # Called from the pystray thread -> marshal the Tk call onto the UI thread.
         self.alpha = alpha
         self.root.after(0, self._apply_alpha)
         self._save_config()
@@ -912,10 +1099,12 @@ class OverlayApp:
             w.refresh()
 
     def _ui_tick(self):
-        """Single UI loop: redraw timers from the model + apply the in-game lock."""
+        """Single UI loop: redraw timers from the model + apply the in-game lock.
+        The lock also runs in standby: the game window (loading screen) is already
+        foreground before the API has data, and a click there must not steal focus."""
         if self.game_active:
             self._refresh_timers()
-            self._update_lock()
+        self._update_lock()
         self.root.after(Config.UI_TICK, self._ui_tick)
 
     def _on_wheel(self, event):
@@ -949,13 +1138,6 @@ class OverlayApp:
         if self.container is not None:
             self.container.config(bg=Config.COLOR_GOLD_DIM if self._locked else Config.COLOR_GOLD)
 
-    def _toggle_lock(self, icon=None, item=None):
-        self.lock_over_game = not self.lock_over_game
-        self._save_config()
-        if not self.lock_over_game:
-            self.root.after(0, lambda: self._set_locked(False))
-        print(f"[Lock] {'ON' if self.lock_over_game else 'OFF'}")
-
     def _set_display_mode(self, mode: str):
         self.display_mode = mode
         self._save_config()
@@ -963,13 +1145,8 @@ class OverlayApp:
         print(f"[Display] {mode}")
 
     def _setup_tray(self):
-        def quit_app(icon, item):
-            print("[Tray] Quitting...")
-            self._save_config()
-            icon.stop()
-            self.root.quit()
-            sys.exit(0)
-
+        # Settings live in the in-window settings dialog (gear); the tray only opens
+        # it and quits. pystray callbacks run on the tray thread -> root.after.
         custom_icon = resource_path("ico/icon.ico")
         flash_icon = resource_path("assets/spells/SummonerFlash.png")
         
@@ -985,74 +1162,15 @@ class OverlayApp:
         if image is None:
             image = Image.new('RGB', (64, 64), color=(255, 255, 0))
 
-        def make_scale_item(pct):
-            val = pct / 100.0  # closed over below; keep lambdas within pystray's argcount limit
-            return pystray.MenuItem(
-                f"{pct}%",
-                lambda icon, item: self._set_scale(val),
-                checked=lambda item: abs(self.scale - val) < 1e-6,
-                radio=True,
-            )
-        scale_menu = pystray.Menu(*[make_scale_item(p) for p in (50, 75, 100, 125, 150, 175, 200)])
-
-        def make_display_item(label, mode):
-            return pystray.MenuItem(
-                label,
-                lambda icon, item: self._set_display_mode(mode),
-                checked=lambda item: self.display_mode == mode,
-                radio=True,
-            )
-        display_menu = pystray.Menu(
-            make_display_item("Ready time (14:25)", "ready"),
-            make_display_item("Countdown", "countdown"),
-        )
-
-        def make_alpha_item(pct):
-            val = pct / 100.0  # closure, not a default arg (pystray argcount limit)
-            return pystray.MenuItem(
-                f"{pct}%",
-                lambda icon, item: self._set_alpha(val),
-                checked=lambda item: abs(self.alpha - val) < 1e-6,
-                radio=True,
-            )
-        alpha_menu = pystray.Menu(*[make_alpha_item(p) for p in Config.ALPHA_CHOICES])
-
+        # Keep lambdas within pystray's argcount limit (<= 2, see CLAUDE.md §3 窗口).
         items = [
-            pystray.MenuItem(
-                "Always on Top",
-                self._toggle_topmost,
-                checked=lambda item: self.is_topmost,
-            ),
-            pystray.MenuItem(
-                "Ultimate (R) Timer",
-                self._toggle_show_r,
-                checked=lambda item: self.show_r,
-            ),
-            pystray.MenuItem(
-                "Compact layout",
-                lambda icon, item: self._set_compact(not self.compact),
-                checked=lambda item: self.compact,
-            ),
-            pystray.MenuItem(
-                "Pin position",
-                self._tray_toggle_pin,
-                checked=lambda item: self.is_pinned,
-            ),
-            pystray.MenuItem("Opacity", alpha_menu),
-            pystray.MenuItem(
-                "Lock while game focused",
-                self._toggle_lock,
-                checked=lambda item: self.lock_over_game,
-            ),
-            pystray.MenuItem("Display", display_menu),
-            pystray.MenuItem("Scale", scale_menu),
-            pystray.MenuItem("Quit", quit_app),
+            pystray.MenuItem("设置", lambda icon, item: self.root.after(0, self.open_settings),
+                             default=True),   # also on tray-icon click
+            pystray.MenuItem("退出", lambda icon, item: self.root.after(0, self._quit)),
         ]
         if Config.ASSETS_OUTDATED:
-            local, latest = Config.ASSETS_OUTDATED
-            items.insert(0, pystray.MenuItem(
-                f"Assets outdated: {local} -> {latest} (run download_assets.py)",
-                lambda icon, item: None, enabled=False))
+            items.insert(0, pystray.MenuItem(assets_outdated_text(),
+                                             lambda icon, item: None, enabled=False))
         menu = pystray.Menu(*items)
         self.tray_icon = pystray.Icon("DeskTimer", image, "DeskTimer", menu)
         
@@ -1068,6 +1186,12 @@ class OverlayApp:
                     self.is_pinned = data.get('pinned', False)
                     self.is_topmost = data.get('topmost', True)
                     self.scale = float(data.get('scale', 1.0))
+                    if not data.get('scale_dpi') and Config.DPI_SCALE != 1.0:
+                        # Saved before sizes followed Windows display scaling: keep
+                        # roughly the same on-screen size (nearest settings choice).
+                        old = self.scale
+                        self.scale = nearest_scale_choice(old / Config.DPI_SCALE)
+                        print(f"[Config] Scale migrated {old} -> {self.scale} (DPI x{Config.DPI_SCALE})")
                     if data.get('display_mode') in ("ready", "countdown"):
                         self.display_mode = data['display_mode']
                     self.lock_over_game = data.get('lock_over_game', True)
@@ -1091,6 +1215,7 @@ class OverlayApp:
             'pinned': self.is_pinned,
             'topmost': self.is_topmost,
             'scale': self.scale,
+            'scale_dpi': True,   # scale is relative to Windows display scaling
             'display_mode': self.display_mode,
             'lock_over_game': self.lock_over_game,
             'alpha': self.alpha,
@@ -1106,12 +1231,34 @@ class OverlayApp:
         except Exception as e:
             print(f"[Config] Save error: {e}")
 
-    def _graceful_exit(self, signum, frame):
-        print("\n[DeskTimer] Stopping...")
+    def _request_quit(self):
+        """Main-window close button: the first click only shows a hint on the drag
+        handle; a second click within QUIT_CONFIRM_MS quits."""
+        if self._quit_job is not None:
+            self._quit()
+            return
+        self._quit_job = self.root.after(Config.QUIT_CONFIRM_MS, self._disarm_quit)
+        if self.handle is not None:
+            self.handle.config(text="再点一次 ✕ 退出", fg=Config.COLOR_GOLD)
+
+    def _disarm_quit(self):
+        self._quit_job = None
+        self._update_pin_visual()
+
+    def _quit(self):
+        """Save and exit (UI thread only). Confirmation, if any, is the caller's."""
+        print("[DeskTimer] Quitting...")
         self._save_config()
         if hasattr(self, 'tray_icon'):
-            self.tray_icon.stop()
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
         self.root.destroy()
+
+    def _graceful_exit(self, signum, frame):
+        print("\n[DeskTimer] Stopping...")
+        self._quit()
         sys.exit(0)
 
     def _apply_topmost(self):
@@ -1120,28 +1267,40 @@ class OverlayApp:
             self.root.wm_attributes("-topmost", bool(self.is_topmost))
         except Exception as e:
             print(f"[Topmost] apply failed: {e}")
+        if self._settings is not None:
+            self._settings.apply_topmost()
 
-    def _toggle_topmost(self, icon=None, item=None):
-        # Called from the pystray thread -> marshal the Tk call onto the UI thread.
-        self.is_topmost = not self.is_topmost
-        self.root.after(0, self._apply_topmost)
+    def _set_topmost(self, on: bool):
+        self.is_topmost = on
+        self._apply_topmost()
         self._save_config()
         print(f"[Topmost] {'ON' if self.is_topmost else 'OFF'}")
 
     def _toggle_pin(self, event=None):
-        self.is_pinned = not self.is_pinned
+        self._set_pinned(not self.is_pinned)
+
+    def _set_pinned(self, on: bool):
+        self.is_pinned = on
         self._update_pin_visual()
         self._save_config()
+        if self._settings is not None:
+            self._settings.sync()   # right-click on the handle also toggles it
 
-    def _tray_toggle_pin(self, icon=None, item=None):
-        self.root.after(0, self._toggle_pin)
+    def open_settings(self):
+        if self._settings is None:
+            self._settings = SettingsWindow(self)
+        else:
+            self._settings.show()
+
+    def _on_settings_closed(self):
+        self._settings = None
 
     def _update_pin_visual(self):
-        self.root.title("DeskTimer (pinned)" if self.is_pinned else "DeskTimer")
+        self.root.title("DeskTimer（位置已固定）" if self.is_pinned else "DeskTimer")
         if self.handle is None:
             return
         if self.is_pinned:
-            self.handle.config(text="🔒 PINNED", fg=Config.COLOR_PINNED, cursor="arrow")
+            self.handle.config(text="🔒 位置已固定", fg=Config.COLOR_PINNED, cursor="arrow")
         else:
             self.handle.config(text="::::", fg=Config.COLOR_HANDLE, cursor="fleur")
 
@@ -1183,15 +1342,12 @@ class OverlayApp:
             for enemy in enemies:
                 self.enemy_data_cache[enemy['champ']] = enemy
 
-            # 2. Build UI only when data first appears
+            # 2. Build UI only when data first appears. The window is already shown
+            # (standby), so no deiconify here: that would activate it and steal focus.
             if not self.game_active:
-                print("[DeskTimer] Data found, showing window.")
-                self._build_enemy_rows(enemies)
-                self.root.deiconify()
-                self.root.geometry(f"+{self.saved_x}+{self.saved_y}")
-                self.root.update_idletasks()   # wrapper hwnd exists before DWM styling
-                self._apply_window_attrs()
+                print("[DeskTimer] Data found, building enemy rows.")
                 self.game_active = True
+                self._build_enemy_rows(enemies)
 
             # NOTE: We do NOT rebuild UI in loop to preserve running timers.
             # Haste data is fetched from cache dynamically on click.
@@ -1202,9 +1358,7 @@ class OverlayApp:
                 print(f"[DeskTimer] Poll missed ({self._miss_count}/{Config.MISS_LIMIT}), keeping window.")
             else:
                 self._miss_count = 0
-                print("[DeskTimer] Data lost, hiding window.")
-                self._set_locked(False)
-                self.root.withdraw()
+                print("[DeskTimer] Data lost, back to standby.")
                 self._save_config()
                 self.game_active = False
                 self.enemy_data_cache.clear()
@@ -1212,6 +1366,7 @@ class OverlayApp:
                 self.tp_shown.clear()
                 self.timers.clear()
                 self.clock.reset()
+                self._build_standby_rows()
 
         self.root.after(Config.CHECK_INTERVAL, self._monitor_game_loop)
 
@@ -1237,14 +1392,8 @@ class OverlayApp:
         if not enemies: return
         self._ensure_cosmic_images()
 
-        s = Config.s
         for i, enemy in enumerate(enemies):
-            if i > 0 and Config.SHOW_SEPARATOR:
-                sep = tk.Frame(self.enemies_frame, bg=Config.COLOR_SEPARATOR, height=s(1))
-                sep.pack(fill="x", padx=Config.g(10), pady=Config.g(2))
-
-            row = tk.Frame(self.enemies_frame, bg=Config.COLOR_BG)
-            row.pack(fill="x", pady=s(Config.ROW_PADDING_Y))
+            row = self._new_row(i)
 
             champ = enemy['champ']
             champ_icon = AssetManager.load_icon("champions", champ, (Config.ICON_SIZE, Config.ICON_SIZE), is_round=True)
@@ -1295,6 +1444,43 @@ class OverlayApp:
                 self.tp_shown[champ] = True
             else:
                 self.tp_shown[champ] = False
+
+    def _new_row(self, i: int) -> tk.Frame:
+        """One enemy row (+ separator above it in the normal layout)."""
+        s = Config.s
+        if i > 0 and Config.SHOW_SEPARATOR:
+            sep = tk.Frame(self.enemies_frame, bg=Config.COLOR_SEPARATOR, height=s(1))
+            sep.pack(fill="x", padx=Config.g(10), pady=Config.g(2))
+        row = tk.Frame(self.enemies_frame, bg=Config.COLOR_BG)
+        row.pack(fill="x", pady=s(Config.ROW_PADDING_Y))
+        return row
+
+    def _build_standby_rows(self):
+        """No game yet: STANDBY_ROWS placeholder rows with the same slots and paddings
+        as real rows (portrait, R, two spells, cosmic eye), so the window already has
+        its in-game size; a status line sits on top."""
+        self._build_enemy_rows([])
+        size, eye = Config.ICON_SIZE, Config.EYE_SIZE
+        line = Config.COLOR_PLACEHOLDER
+
+        def slot(row, w, oval=False, **pack):
+            c = tk.Canvas(row, width=w, height=w, bg=Config.COLOR_BG, highlightthickness=0)
+            shape = c.create_oval if oval else c.create_rectangle
+            shape(1, 1, w - 2, w - 2, outline=line, width=max(1, Config.s(1)))
+            c.pack(side="left", **pack)
+
+        for i in range(Config.STANDBY_ROWS):
+            row = self._new_row(i)
+            slot(row, size, oval=True, padx=(0, Config.g(8)))
+            if self.show_r:
+                slot(row, size, padx=(0, Config.g(6)))
+            slot(row, size, padx=Config.g(3))
+            slot(row, size, padx=Config.g(3))
+            slot(row, eye, oval=True, padx=(Config.g(8), 0))
+
+        tk.Label(self.enemies_frame, text="等待对局开始", bg=Config.COLOR_BG,
+                 fg=Config.COLOR_TEXT_DIM, font=(Config.UI_FONT, -max(10, Config.s(11)))
+                 ).place(relx=0.5, rely=0.5, anchor="center")
 
     def _toggle_cosmic(self, champ: str):
         on = not self.cosmic_toggle.get(champ, False)
@@ -1355,12 +1541,26 @@ def _enable_dpi_awareness():
     except Exception:
         pass
 
+def _system_dpi_scale() -> float:
+    """Windows display scaling as a factor (150% -> 1.5). Read once at startup, after
+    _enable_dpi_awareness (an unaware process is always told 96 DPI); moving the
+    window to a monitor with different scaling does not re-scale it."""
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()   # Win10 1607+
+        if dpi > 0:
+            return dpi / 96
+    except Exception:
+        pass
+    return 1.0
+
 if __name__ == "__main__":
     checker = SingleInstanceChecker()
     if checker.is_already_running():
         sys.exit(0)
 
     _enable_dpi_awareness()
+    Config.DPI_SCALE = _system_dpi_scale()
+    print(f"[DPI] display scaling x{Config.DPI_SCALE}")
     DDragonManager.update_timers()
     AbilityData.load()
     app = OverlayApp()
